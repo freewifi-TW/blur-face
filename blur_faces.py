@@ -197,7 +197,7 @@ def create_detector(args):
     elif args.detector == "yunet":
         det = YunetDetector(args.conf)
     else:
-        det = UnionDetector([ScrfdDetector(args.conf, args.det_size), YunetDetector(max(args.conf, 0.5))])
+        det = UnionDetector([ScrfdDetector(args.conf, args.det_size), YunetDetector(args.conf)])
     if getattr(args, "head", False):
         det = UnionDetector([det, HeadDetector(max(args.conf, 0.35))])
     return det
