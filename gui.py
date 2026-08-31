@@ -10,7 +10,8 @@ import sys
 import traceback
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import Qt, QThread, QUrl, Signal
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QFileDialog, QGridLayout, QGroupBox,
     QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMainWindow,
@@ -150,6 +151,11 @@ class MainWindow(QMainWindow):
         # --- 檔案清單 ---
         self.list = DropList()
         self.list.files_dropped.connect(self.add_paths)
+        self.list.itemDoubleClicked.connect(self.open_output)
+        self.list.setToolTip(
+            "支援拖放檔案或整個資料夾（資料夾會自動抓出裡面所有照片和影片）\n"
+            "支援格式：jpg/png/webp 等照片，mp4/mov/mkv 等影片"
+        )
         layout.addWidget(QLabel("把照片、影片或整個資料夾拖到下面："))
         layout.addWidget(self.list, stretch=1)
 
@@ -162,49 +168,97 @@ class MainWindow(QMainWindow):
         layout.addLayout(btns)
 
         # --- 參數 ---
-        opts = QGroupBox("設定")
+        opts = QGroupBox("設定（滑鼠停在欄位上可看說明）")
         grid = QGridLayout(opts)
+
+        def add_field(label_text: str, widget, row: int, col: int, tip: str, extra=None):
+            """加一組「標籤 + 控制項」，兩者都掛上說明 tooltip。"""
+            lbl = QLabel(label_text)
+            for w in filter(None, (lbl, widget, extra)):
+                w.setToolTip(tip)
+            grid.addWidget(lbl, row, col)
+            grid.addWidget(widget, row, col + 1)
+            if extra is not None:
+                grid.addWidget(extra, row, col + 2)
 
         self.mode = QComboBox()
         self.mode.addItems(["馬賽克", "高斯模糊"])
-        grid.addWidget(QLabel("打碼方式"), 0, 0)
-        grid.addWidget(self.mode, 0, 1)
+        add_field("打碼方式", self.mode, 0, 0, (
+            "馬賽克：把臉變成色塊格子\n"
+            "高斯模糊：把臉霧化\n"
+            "兩種都能遮蔽身分，馬賽克的遮蔽效果較強"
+        ))
 
         self.strength = QSlider(Qt.Horizontal)
         self.strength.setRange(1, 10)
         self.strength.setValue(5)
         self.strength_lbl = QLabel("5")
         self.strength.valueChanged.connect(lambda v: self.strength_lbl.setText(str(v)))
-        grid.addWidget(QLabel("強度"), 0, 2)
-        grid.addWidget(self.strength, 0, 3)
-        grid.addWidget(self.strength_lbl, 0, 4)
+        add_field("強度", self.strength, 0, 2, (
+            "打碼的粗細程度（1–10）\n"
+            "越大格子越粗 / 越模糊，越難被辨識\n"
+            "機敏內容建議 7 以上"
+        ), extra=self.strength_lbl)
 
         self.detector = QComboBox()
         self.detector.addItems([label for label, _ in DETECTOR_CHOICES])
-        grid.addWidget(QLabel("偵測器"), 1, 0)
-        grid.addWidget(self.detector, 1, 1)
+        add_field("偵測器", self.detector, 1, 0, (
+            "高準確度（SCRFD）：側臉、小臉、遮擋臉都抓得到，建議使用\n"
+            "快速（YuNet）：速度快約 18 倍，但刁鑽角度容易漏\n"
+            "最高召回：兩個模型一起跑取聯集，最慢但最不會漏"
+        ))
 
         self.det_size = QComboBox()
         self.det_size.addItems(["640（快）", "960", "1280（建議）", "1920（小臉多）"])
         self.det_size.setCurrentIndex(2)
-        grid.addWidget(QLabel("偵測解析度"), 1, 2)
-        grid.addWidget(self.det_size, 1, 3)
+        add_field("偵測解析度", self.det_size, 1, 2, (
+            "AI 掃描畫面時使用的解析度\n"
+            "越高越能抓到畫面中很小的臉，但速度越慢\n"
+            "（640 比 1280 快約 4 倍；遠處人很多時選 1920）"
+        ))
 
         self.conf = QSlider(Qt.Horizontal)
         self.conf.setRange(20, 80)
         self.conf.setValue(40)
         self.conf_lbl = QLabel("0.40")
         self.conf.valueChanged.connect(lambda v: self.conf_lbl.setText(f"{v / 100:.2f}"))
-        grid.addWidget(QLabel("偵測門檻"), 2, 0)
-        grid.addWidget(self.conf, 2, 1)
-        grid.addWidget(self.conf_lbl, 2, 2)
+        add_field("偵測門檻", self.conf, 2, 0, (
+            "AI 認定「這是人臉」所需的最低信心分數（0.20–0.80）\n"
+            "調低＝寧可錯殺：模糊臉、小臉也抓，但可能誤打非人臉\n"
+            "調高＝只打很確定的臉，但容易漏抓\n"
+            "有臉漏抓→調低到 0.25–0.30；風景被亂打碼→調高到 0.50–0.60"
+        ), extra=self.conf_lbl)
 
         self.ellipse = QCheckBox("橢圓遮罩")
+        self.ellipse.setToolTip("打碼區域用橢圓形取代矩形，觀感較自然\n（遮蔽範圍比矩形略小）")
         grid.addWidget(self.ellipse, 2, 3)
 
+        self.head = QCheckBox("頭部偵測（含背對鏡頭）")
+        self.head.setChecked(True)
+        self.head.setToolTip(
+            "除了臉之外也偵測「整顆頭」（CrowdHuman 模型）\n"
+            "背對鏡頭、側面、低頭的人也會被遮蔽 — 隱私保護建議開啟\n"
+            "關閉後只遮有偵測到臉的人"
+        )
+        grid.addWidget(self.head, 3, 0, 1, 2)
+
+        self.track = QCheckBox("影片追蹤補洞")
+        self.track.setChecked(True)
+        self.track.setToolTip(
+            "影片先整部偵測、把同一個人在時間軸上串成軌跡，\n"
+            "短暫漏偵測的幀用前後幀位置自動補齊，避免馬賽克閃爍或漏幀\n"
+            "建議開啟；關閉則改為逐幀即時處理"
+        )
+        grid.addWidget(self.track, 3, 2)
+
         self.out_btn = QPushButton("輸出資料夾：原檔旁（點擊變更）")
+        self.out_btn.setToolTip(
+            "處理結果的存放位置，原始檔案永遠不會被修改\n"
+            "預設：輸出在每個原檔旁邊，檔名加上 _blurred\n"
+            "點擊可改成統一輸出到你指定的資料夾"
+        )
         self.out_btn.clicked.connect(self.pick_out_dir)
-        grid.addWidget(self.out_btn, 3, 0, 1, 5)
+        grid.addWidget(self.out_btn, 4, 0, 1, 5)
 
         layout.addWidget(opts)
 
@@ -256,6 +310,12 @@ class MainWindow(QMainWindow):
         self.files.clear()
         self.status.setText("就緒")
 
+    def open_output(self, item):
+        """雙擊已完成的項目 → 用系統預設程式開啟輸出檔。"""
+        out = default_output(self.files[self.list.row(item)], self.out_dir)
+        if out.exists():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(out)))
+
     def pick_out_dir(self):
         d = QFileDialog.getExistingDirectory(self, "選擇輸出資料夾")
         if d:
@@ -273,7 +333,8 @@ class MainWindow(QMainWindow):
             pad=0.15,
             keep=4,
             ellipse=self.ellipse.isChecked(),
-            preview=False,
+            head=self.head.isChecked(),
+            track=self.track.isChecked(),
         )
 
     def start(self):
@@ -305,7 +366,7 @@ class MainWindow(QMainWindow):
         self.start_btn.setEnabled(not busy)
         self.cancel_btn.setEnabled(busy)
         for w in (self.mode, self.strength, self.detector, self.det_size,
-                  self.conf, self.ellipse, self.out_btn):
+                  self.conf, self.ellipse, self.head, self.track, self.out_btn):
             w.setEnabled(not busy)
 
 

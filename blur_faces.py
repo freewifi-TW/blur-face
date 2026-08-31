@@ -37,6 +37,7 @@ def find_ffmpeg() -> str | None:
 MODELS_DIR = resource_path("models")
 SCRFD_MODEL = MODELS_DIR / "det_10g.onnx"
 YUNET_MODEL = MODELS_DIR / "face_detection_yunet_2023mar.onnx"
+HEAD_MODEL = MODELS_DIR / "crowdhuman_yolov5m.onnx"
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".m4v", ".webm"}
 
@@ -134,6 +135,47 @@ class YunetDetector:
         return [tuple((face[:4] / scale).astype(int)) for face in faces]
 
 
+class HeadDetector:
+    """YOLOv5m（CrowdHuman 頭部類別）偵測器：抓「整顆頭」，背對鏡頭、極端角度也偵測得到。"""
+
+    INPUT = 640
+    NMS_IOU = 0.45
+
+    def __init__(self, conf: float):
+        if not HEAD_MODEL.exists():
+            sys.exit(f"找不到模型檔 {HEAD_MODEL}，請先下載（見 README.md）")
+        import onnxruntime as ort
+
+        so = ort.SessionOptions()
+        so.log_severity_level = 3
+        self.session = ort.InferenceSession(
+            str(HEAD_MODEL), sess_options=so, providers=["CPUExecutionProvider"]
+        )
+        self.input_name = self.session.get_inputs()[0].name
+        self.conf = conf
+
+    def detect(self, frame: np.ndarray) -> list[tuple[int, int, int, int]]:
+        h, w = frame.shape[:2]
+        scale = min(self.INPUT / h, self.INPUT / w)
+        nh, nw = int(h * scale), int(w * scale)
+        canvas = np.full((self.INPUT, self.INPUT, 3), 114, dtype=np.uint8)
+        canvas[:nh, :nw] = cv2.resize(frame, (nw, nh))
+        blob = np.ascontiguousarray(
+            canvas[:, :, ::-1].transpose(2, 0, 1)[None], dtype=np.float32
+        ) / 255.0
+
+        # 輸出 (25200, 7)：cx, cy, w, h, objectness, person 分數, head 分數
+        out = self.session.run(None, {self.input_name: blob})[0][0]
+        scores = out[:, 4] * out[:, 6]  # 只取 head 類別
+        keep = scores >= self.conf
+        if not keep.any():
+            return []
+        cx, cy, bw, bh = out[keep, 0], out[keep, 1], out[keep, 2], out[keep, 3]
+        boxes = np.stack([cx - bw / 2, cy - bh / 2, bw, bh], axis=1) / scale
+        idxs = cv2.dnn.NMSBoxes(boxes.tolist(), scores[keep].tolist(), self.conf, self.NMS_IOU)
+        return [tuple(int(v) for v in boxes[i]) for i in np.array(idxs).flatten()]
+
+
 class UnionDetector:
     """聯集多個偵測器的結果（重疊框合併），追求最高召回率。"""
 
@@ -151,10 +193,14 @@ class UnionDetector:
 
 def create_detector(args):
     if args.detector == "scrfd":
-        return ScrfdDetector(args.conf, args.det_size)
-    if args.detector == "yunet":
-        return YunetDetector(args.conf)
-    return UnionDetector([ScrfdDetector(args.conf, args.det_size), YunetDetector(max(args.conf, 0.5))])
+        det = ScrfdDetector(args.conf, args.det_size)
+    elif args.detector == "yunet":
+        det = YunetDetector(args.conf)
+    else:
+        det = UnionDetector([ScrfdDetector(args.conf, args.det_size), YunetDetector(max(args.conf, 0.5))])
+    if getattr(args, "head", False):
+        det = UnionDetector([det, HeadDetector(max(args.conf, 0.35))])
+    return det
 
 
 def expand_box(box, pad: float, frame_shape) -> tuple[int, int, int, int]:
@@ -196,6 +242,13 @@ def censor_region(frame, x1, y1, x2, y2, mode: str, strength: int, ellipse: bool
         frame[y1:y2, x1:x2] = censored
 
 
+def apply_boxes(frame, boxes, args):
+    """把一組偵測框打碼到畫面上。"""
+    for box in boxes:
+        x1, y1, x2, y2 = expand_box(box, args.pad, frame.shape)
+        censor_region(frame, x1, y1, x2, y2, args.mode, args.strength, args.ellipse)
+
+
 def process_frame(frame, detector, args, sticky_boxes: list | None = None):
     """偵測並打碼單一畫面。sticky_boxes 用於影片的跨幀補償，避免偶爾漏偵測造成閃爍。
 
@@ -211,13 +264,68 @@ def process_frame(frame, detector, args, sticky_boxes: list | None = None):
     else:
         draw_boxes = boxes
 
-    for box in draw_boxes:
-        x1, y1, x2, y2 = expand_box(box, args.pad, frame.shape)
-        if args.preview:
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-        else:
-            censor_region(frame, x1, y1, x2, y2, args.mode, args.strength, args.ellipse)
+    apply_boxes(frame, draw_boxes, args)
     return len(boxes)
+
+
+def _iou(a, b) -> float:
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    ix = max(0, min(ax + aw, bx + bw) - max(ax, bx))
+    iy = max(0, min(ay + ah, by + bh) - max(ay, by))
+    inter = ix * iy
+    union = aw * ah + bw * bh - inter
+    return inter / union if union > 0 else 0.0
+
+
+def build_tracks(detections, iou_thresh=0.3, max_gap=15, extend=6, n_frames=None):
+    """把逐幀偵測框串成軌跡：短暫漏偵測的幀用前後幀線性內插補齊，並向軌跡前後各延伸幾幀。
+
+    detections: list[list[box]]，索引即幀號。回傳 dict[幀號] -> [box, ...]。
+    """
+    tracks: list[dict] = []  # {"boxes": {幀號: box}, "last": 最後出現的幀號}
+    for idx, boxes in enumerate(detections):
+        active = [t for t in tracks if idx - t["last"] <= max_gap]
+        pairs = sorted(
+            ((_iou(t["boxes"][t["last"]], b), ti, bi)
+             for ti, t in enumerate(active) for bi, b in enumerate(boxes)),
+            reverse=True,
+        )
+        used_t, used_b = set(), set()
+        for iou_v, ti, bi in pairs:
+            if iou_v < iou_thresh:
+                break
+            if ti in used_t or bi in used_b:
+                continue
+            active[ti]["boxes"][idx] = boxes[bi]
+            active[ti]["last"] = idx
+            used_t.add(ti)
+            used_b.add(bi)
+        for bi, b in enumerate(boxes):
+            if bi not in used_b:
+                tracks.append({"boxes": {idx: b}, "last": idx})
+
+    n = n_frames if n_frames is not None else len(detections)
+    per_frame: dict[int, list] = {}
+    for t in tracks:
+        idxs = sorted(t["boxes"])
+        filled: dict[int, tuple] = {}
+        for a, b in zip(idxs, idxs[1:]):
+            filled[a] = t["boxes"][a]
+            for i in range(a + 1, b):  # 漏偵測的幀：線性內插
+                w = (i - a) / (b - a)
+                filled[i] = tuple(
+                    int(round(pa * (1 - w) + pb * w))
+                    for pa, pb in zip(t["boxes"][a], t["boxes"][b])
+                )
+        filled[idxs[-1]] = t["boxes"][idxs[-1]]
+        for i in range(max(0, idxs[0] - extend), idxs[0]):  # 軌跡起點往前延伸
+            filled[i] = t["boxes"][idxs[0]]
+        for i in range(idxs[-1] + 1, min(n, idxs[-1] + 1 + extend)):  # 終點往後延伸
+            filled[i] = t["boxes"][idxs[-1]]
+        for i, b in filled.items():
+            per_frame.setdefault(i, []).append(b)
+    return per_frame
 
 
 def process_image(path: Path, out_path: Path, detector, args, log=print):
@@ -244,11 +352,105 @@ def mux_audio(original: Path, video_only: Path, out_path: Path) -> bool:
         "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest",
         str(out_path),
     ]
-    return subprocess.run(cmd).returncode == 0
+    kwargs = {}
+    if sys.platform == "win32":
+        # Windows 的 GUI 程式啟動 console 子程序會閃出主控台視窗，加旗標隱藏
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+    return subprocess.run(cmd, **kwargs).returncode == 0
 
 
 def process_video(path: Path, out_path: Path, detector, args, log=print, progress=None, cancel=None):
-    """progress(done, total) 每幀回報進度；cancel() 回傳 True 時中止並清理。"""
+    """progress(done, total) 回報進度；cancel() 回傳 True 時中止並清理。
+
+    預設走兩段式（全片偵測 → 追蹤補洞 → 套用輸出）；args.track=False 時走
+    逐幀即時處理（sticky_boxes 補償）。
+    """
+    if getattr(args, "track", True):
+        return _process_video_tracked(path, out_path, detector, args, log, progress, cancel)
+    return _process_video_stream(path, out_path, detector, args, log, progress, cancel)
+
+
+def _process_video_tracked(path, out_path, detector, args, log, progress, cancel):
+    cap = cv2.VideoCapture(str(path))
+    if not cap.isOpened():
+        log(f"⚠ 無法開啟影片：{path}")
+        return None
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    # 第一遍：全片偵測（最耗時），只收集偵測框
+    detections: list[list] = []
+    try:
+        while True:
+            if cancel is not None and cancel():
+                log(f"⚠ 已取消：{path.name}")
+                return None
+            ok, frame = cap.read()
+            if not ok:
+                break
+            detections.append(detector.detect(frame))
+            i = len(detections)
+            if progress is not None:
+                progress(i, max(total, i) * 2)
+            elif i % 100 == 0:
+                pct = f"{i / total:.0%}" if total > 0 else f"{i} 幀"
+                print(f"  {path.name}: 偵測中 {pct}", flush=True)
+    finally:
+        cap.release()
+
+    n = len(detections)
+    if n == 0:
+        log(f"⚠ 無法解碼任何畫面：{path.name}")
+        return None
+
+    per_frame = build_tracks(detections, n_frames=n)
+    total_faces = sum(len(b) for b in detections)
+    covered = sum(len(v) for v in per_frame.values())
+
+    # 第二遍：把追蹤補齊後的框套用到每一幀並輸出
+    cap = cv2.VideoCapture(str(path))
+    tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+    tmp_path = Path(tmp.name)
+    tmp.close()
+    writer = None
+    idx = 0
+    cancelled = False
+    try:
+        while True:
+            if cancel is not None and cancel():
+                cancelled = True
+                break
+            ok, frame = cap.read()
+            if not ok:
+                break
+            if writer is None:
+                h, w = frame.shape[:2]
+                writer = cv2.VideoWriter(str(tmp_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+            apply_boxes(frame, per_frame.get(idx, []), args)
+            writer.write(frame)
+            idx += 1
+            if progress is not None:
+                progress(n + idx, n * 2)
+    finally:
+        cap.release()
+        if writer is not None:
+            writer.release()
+
+    if cancelled or idx == 0:
+        tmp_path.unlink(missing_ok=True)
+        log(f"⚠ {'已取消' if cancelled else '無法輸出任何畫面'}：{path.name}")
+        return None
+
+    if mux_audio(path, tmp_path, out_path):
+        tmp_path.unlink(missing_ok=True)
+    else:
+        shutil.move(str(tmp_path), str(out_path))
+        log("  （未偵測到 ffmpeg 或合併失敗，輸出不含音軌）")
+    log(f"✓ {path.name} → {out_path.name}（共 {idx} 幀，偵測 {total_faces} 次，追蹤補齊後遮蔽 {covered} 次）")
+    return idx, total_faces
+
+
+def _process_video_stream(path, out_path, detector, args, log, progress, cancel):
     cap = cv2.VideoCapture(str(path))
     if not cap.isOpened():
         log(f"⚠ 無法開啟影片：{path}")
@@ -334,8 +536,10 @@ def main():
     parser.add_argument("--keep", type=int, default=4,
                         help="影片中偵測框延續的幀數，用來補偵測空窗")
     parser.add_argument("--ellipse", action="store_true", help="使用橢圓形遮罩（預設矩形）")
-    parser.add_argument("--preview", action="store_true",
-                        help="不打碼，只畫出偵測框，用來確認偵測效果")
+    parser.add_argument("--head", action="store_true",
+                        help="加上頭部偵測（含背對鏡頭、極端角度），遮蔽範圍從臉擴大到整顆頭")
+    parser.add_argument("--no-track", dest="track", action="store_false",
+                        help="停用影片兩段式追蹤補洞，改回逐幀即時處理（較省記憶體）")
     args = parser.parse_args()
 
     in_path = Path(args.input).expanduser()

@@ -4,6 +4,11 @@
 
 人臉偵測預設使用 **SCRFD-10G**（InsightFace，WIDER FACE hard 集約 83% AP），對**側臉、小臉、遮擋臉**都有高召回率；另內建輕量的 YuNet 可選。
 
+進階遮蔽能力：
+
+- **頭部偵測**（`--head` / GUI 勾選）：加掛 CrowdHuman YOLOv5m 頭部模型，**背對鏡頭、極端角度的人也會被遮蔽**（從「遮臉」升級為「遮頭」）
+- **影片追蹤補洞**（預設開啟，`--no-track` 停用）：兩段式處理 — 全片偵測後把同一個人串成時間軸軌跡，短暫漏偵測的幀用前後幀線性內插補齊，並向軌跡前後延伸，消除馬賽克閃爍與漏幀
+
 提供三種使用方式：**桌面 App（GUI）**、**命令列（CLI）**、Python 模組。
 
 ## 桌面 App
@@ -57,6 +62,10 @@ curl -L -o models/face_detection_yunet_2023mar.onnx \
   "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
 ```
 
+`models/crowdhuman_yolov5m.onnx`（頭部偵測）沒有現成下載點：它是從
+[MK-CUPIST/crowdhuman_yolov5m](https://huggingface.co/MK-CUPIST/crowdhuman_yolov5m) 的 `.pt`
+用 yolov5 v5.0 的 `models/export.py --grid` 轉出的（本 repo 已內含轉好的檔案）。
+
 ## 使用方式
 
 ```bash
@@ -72,11 +81,8 @@ curl -L -o models/face_detection_yunet_2023mar.onnx \
 # 高斯模糊 + 橢圓遮罩，強度 8
 .venv/bin/python blur_faces.py photo.jpg --mode blur --ellipse --strength 8
 
-# 先預覽偵測框（不打碼），確認有沒有漏抓
-.venv/bin/python blur_faces.py photo.jpg --preview
-
-# 極端場景追求最高召回：雙偵測器聯集 + 低門檻 + 高偵測解析度
-.venv/bin/python blur_faces.py photo.jpg --detector both --conf 0.3 --det-size 1920
+# 極端場景追求最高召回：雙偵測器聯集 + 頭部偵測 + 低門檻 + 高偵測解析度
+.venv/bin/python blur_faces.py photo.jpg --detector both --head --conf 0.3 --det-size 1920
 ```
 
 ## 參數
@@ -90,9 +96,10 @@ curl -L -o models/face_detection_yunet_2023mar.onnx \
 | `--det-size` | `1280` | SCRFD 偵測解析度；小臉多可調到 1920，追求速度用 640 |
 | `--conf` | `0.4` | 偵測信心門檻；漏抓調低（如 0.3）、誤抓調高 |
 | `--pad` | `0.15` | 偵測框向外擴張比例 |
-| `--keep` | `4` | 影片中偵測框延續幀數，補偵測空窗、減少閃爍 |
+| `--head` | 關 | 加上頭部偵測（含背對鏡頭），遮蔽範圍從臉擴大到整顆頭 |
+| `--no-track` | （追蹤預設開） | 停用影片兩段式追蹤補洞，改回逐幀即時處理 |
+| `--keep` | `4` | 逐幀模式下偵測框延續幀數（追蹤模式不使用） |
 | `--ellipse` | 關 | 橢圓形遮罩（預設矩形） |
-| `--preview` | 關 | 只畫偵測框不打碼，用來檢查偵測效果 |
 
 ## 準確度實測（29 人合照，M 系列 Mac）
 
@@ -103,10 +110,11 @@ curl -L -o models/face_detection_yunet_2023mar.onnx \
 | 遮擋（下半臉全遮） | 28/29 | 29/29 |
 | 旋轉 25 度 | 25/29 | 29/29 |
 | 側臉（2 張真實側臉照） | — | 全中 |
+| 背對鏡頭人群（GT 15+ 顆頭） | 2（純臉部） | **21**（開 `--head`） |
 
 速度（單幀偵測）：SCRFD `--det-size 1280` 約 275ms、`640` 約 76ms；YuNet 約 15ms。
 
 ## 注意事項
 
-- 極端角度（接近後腦勺）、嚴重模糊的臉仍可能漏偵測。**發布前建議先用 `--preview` 檢查**，機敏內容可用 `--detector both --conf 0.3` 拉滿召回率。
+- 嚴重模糊、極小的臉仍可能漏偵測。機敏內容建議開啟 `--head`（連背對鏡頭的頭都遮），並用 `--detector both --conf 0.3` 拉滿召回率，**發布前抽查輸出結果**。
 - 馬賽克 / 模糊在理論上有被還原的風險，對機敏內容可搭配較高 `--strength`。
