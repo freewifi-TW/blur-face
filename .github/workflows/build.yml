@@ -1,0 +1,53 @@
+name: build
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            icon: assets/icon.icns
+            sep: ":"
+          - os: windows-latest
+            icon: assets/icon.ico
+            sep: ";"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install -r requirements.txt pyinstaller
+
+      - run: pyinstaller --noconfirm --windowed --name BlurFace --icon "${{ matrix.icon }}" --add-data "models${{ matrix.sep }}models" gui.py
+
+      - name: Smoke test (macOS)
+        if: runner.os == 'macOS'
+        run: QT_QPA_PLATFORM=offscreen dist/BlurFace.app/Contents/MacOS/BlurFace --smoke-test
+
+      - name: Smoke test (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          $env:QT_QPA_PLATFORM = "offscreen"
+          $p = Start-Process -FilePath "dist/BlurFace/BlurFace.exe" -ArgumentList "--smoke-test" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { exit 1 }
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: cd dist && ditto -c -k --keepParent BlurFace.app BlurFace-macos.zip
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        run: Compress-Archive -Path dist/BlurFace -DestinationPath dist/BlurFace-windows.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BlurFace-${{ runner.os }}
+          path: dist/*.zip
