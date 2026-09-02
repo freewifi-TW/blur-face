@@ -20,6 +20,39 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+# 在虛擬桌面 / 串流環境（如 Virtual Desktop）中，OpenCV 的 OpenCL(T-API) 可能被導向虛擬顯示卡，
+# 使 cv2.resize 等運算每次呼叫都極慢。我們一律傳 numpy Mat、本來就走 CPU，關掉 OpenCL 無副作用。
+try:
+    if cv2.ocl.haveOpenCL():
+        cv2.ocl.setUseOpenCL(False)
+except Exception:
+    pass
+
+
+def process_rss_mb() -> float | None:
+    """回傳目前行程的常駐記憶體（MB），best-effort、跨平台、不需 psutil；取不到回傳 None。"""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            class _PMC(ctypes.Structure):
+                _fields_ = [("cb", ctypes.c_uint32), ("PageFaultCount", ctypes.c_uint32),
+                            ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t),
+                            ("QuotaPeakPagedPoolUsage", ctypes.c_size_t), ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                            ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t), ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                            ("PagefileUsage", ctypes.c_size_t), ("PeakPagefileUsage", ctypes.c_size_t)]
+            c = _PMC(); c.cb = ctypes.sizeof(_PMC)
+            h = ctypes.windll.kernel32.GetCurrentProcess()
+            if ctypes.windll.psapi.GetProcessMemoryInfo(h, ctypes.byref(c), c.cb):
+                return c.WorkingSetSize / (1024 * 1024)
+        except Exception:
+            return None
+    try:
+        import resource
+        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss  # mac: bytes；linux: KB（此為峰值）
+        return rss / (1024 * 1024) if sys.platform == "darwin" else rss / 1024
+    except Exception:
+        return None
+
 
 def resource_path(rel: str) -> Path:
     """開發時相對於原始碼；PyInstaller 打包後相對於解包目錄。"""
@@ -178,8 +211,14 @@ def runtime_info() -> str:
             gpu_info = f" · 顯示卡 {' / '.join(gpus) or '未知'}"
         except Exception:  # noqa: BLE001
             gpu_info = " · 顯示卡 查詢失敗"
+    try:
+        ocl = "關" if cv2.ocl.haveOpenCL() else "無"  # 我們主動關閉，顯示「關」代表偵測得到但已停用
+    except Exception:
+        ocl = "?"
+    rss = process_rss_mb()
+    mem = f" · 記憶體 {rss:.0f}MB" if rss else ""
     return (f"{platform.system()} {platform.release()} · Python {platform.python_version()} · "
-            f"{ort_info} · OpenCV {cv2.__version__} · ffmpeg {find_ffmpeg() or '無'}{gpu_info}")
+            f"{ort_info} · OpenCV {cv2.__version__}（OpenCL {ocl}）· ffmpeg {find_ffmpeg() or '無'}{gpu_info}{mem}")
 
 
 def device_label(detector) -> str:
@@ -836,8 +875,12 @@ class _Heartbeat:
                 avg = frames / el if el else 0
                 pct = f"{frames / self.total:.0%}" if self.total > 0 else f"{frames} 幀"
                 eta = f"，剩約 {(self.total - frames) / inst:.0f}s" if self.total > 0 and inst > 0.1 else ""
+                rss = process_rss_mb()
+                extra = f"，本幀 {self.stats.get('last_boxes', 0)} 框"
+                if rss:
+                    extra += f"，記憶體 {rss:.0f}MB"
                 self.log(f"⏳ 進度 {pct}（{frames} 幀，即時 {inst:.1f} fps、平均 {avg:.1f} fps，"
-                         f"目前【{phase}】{eta}）")
+                         f"目前【{phase}】{extra}{eta}）")
                 last_report = now
                 stalled = False
             if not stalled:
@@ -883,6 +926,8 @@ def _iter_censored_frames(cap, detector, args, cancel, stats: dict, report):
         stats["t_track"] += time.time() - t0
         for out_frame, out_boxes in emitted:
             stats["covered"] += len(out_boxes)
+            stats["last_boxes"] = len(out_boxes)
+            stats["max_boxes"] = max(stats["max_boxes"], len(out_boxes))
             stats["phase"] = "censor"
             t0 = time.time()
             apply_boxes(out_frame, out_boxes, args)
@@ -911,7 +956,8 @@ def _process_video_once(path, out_path, detector, args, sink: str, ffmpeg, log, 
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     stats = {"frames_read": 0, "faces": 0, "covered": 0, "cancelled": False,
              "t_decode": 0.0, "t_detect": 0.0, "t_track": 0.0, "t_censor": 0.0,
-             "t_tobytes": 0.0, "t_pipe": 0.0, "phase": "decode", "t_advance": time.time()}
+             "t_tobytes": 0.0, "t_pipe": 0.0, "phase": "decode", "t_advance": time.time(),
+             "last_boxes": 0, "max_boxes": 0}
     rescue_before = rescue_stats(detector)
     t_start = time.time()
 
@@ -993,8 +1039,10 @@ def _process_video_once(path, out_path, detector, args, sink: str, ffmpeg, log, 
     if rescue_before and rescue_after and rescue_after[0] > rescue_before[0]:
         trig, rf, rb = (a - b for a, b in zip(rescue_after, rescue_before))
         detail += f"；特寫補救觸發 {trig} 幀、救回 {rf} 幀 {rb} 框"
+    avg_boxes = stats["covered"] / max(1, written)
+    box_note = f"，平均 {avg_boxes:.1f} 框/幀（尖峰 {stats['max_boxes']}）" if avg_boxes >= 3 else ""
     log(f"✓ {path.name} → {out_path.name}（{w}x{h}，共 {written} 幀，{elapsed:.1f}s ≈ {written / elapsed:.1f} fps；"
-        f"{parts}；{detail}；編碼 {writer.encoder}）")
+        f"{parts}{box_note}；{detail}；編碼 {writer.encoder}）")
     return written, stats["faces"]
 
 
