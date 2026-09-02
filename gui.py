@@ -286,6 +286,15 @@ class MainWindow(QMainWindow):
         )
         grid.addWidget(self.track, 3, 2)
 
+        self.rescue = QCheckBox("特寫／旋轉補救")
+        self.rescue.setChecked(True)
+        self.rescue.setToolTip(
+            "整幅畫面都沒抓到臉時，改用另一個模型對轉正、縮小後的畫面再試一次\n"
+            "專門救「臉比畫面還大、手機橫躺 90 度、臉被裁掉一半」的極端特寫\n"
+            "只在沒抓到的幀執行，正常畫面不受影響；沒有人的片段每幀會多約 0.08 秒"
+        )
+        grid.addWidget(self.rescue, 3, 3)
+
         self.gpu = QCheckBox("GPU 加速偵測")
         self.gpu.setChecked(True)
         self.gpu.setToolTip(
@@ -411,6 +420,8 @@ class MainWindow(QMainWindow):
             track=self.track.isChecked(),
             device="auto" if self.gpu.isChecked() else "cpu",
             encoder="auto" if self.hw_encode.isChecked() else "software",
+            multiscale=True,
+            rescue=self.rescue.isChecked(),
         )
 
     def append_log(self, text: str):
@@ -430,9 +441,10 @@ class MainWindow(QMainWindow):
         self.append_log(
             f"開始處理 {len(self.files)} 個檔案 · 偵測器 {args.detector} · 解析度 {args.det_size} · "
             f"門檻 {args.conf:.2f} · 頭部 {'開' if args.head else '關'} · 追蹤 {'開' if args.track else '關'} · "
+            f"補救 {'開' if args.rescue else '關'} · "
             f"裝置 {args.device} · 編碼 {args.encoder} · 輸出 {self.out_dir or '原檔旁'}"
         )
-        key = (args.detector, args.det_size, args.conf, args.head, args.device)
+        key = (args.detector, args.det_size, args.conf, args.head, args.device, args.rescue)
         if key != self.detector_key:
             if self.cached_detector is not None:
                 self.append_log("偵測設定已變更，釋放舊偵測器後重建")
@@ -475,7 +487,7 @@ class MainWindow(QMainWindow):
         self.start_btn.setEnabled(not busy)
         self.cancel_btn.setEnabled(busy)
         for w in (self.mode, self.strength, self.detector, self.det_size, self.conf,
-                  self.ellipse, self.head, self.track, self.gpu, self.hw_encode, self.out_btn):
+                  self.ellipse, self.head, self.track, self.rescue, self.gpu, self.hw_encode, self.out_btn):
             w.setEnabled(not busy)
 
 

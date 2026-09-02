@@ -110,6 +110,7 @@ def create_session(model_path: Path, device: str, input_shape: tuple[int, ...], 
     import onnxruntime as ort
 
     log = log or (lambda *_: None)
+    label = f"{model_path.name}@{input_shape[-1]}"
 
     def make(providers, model=None):
         so = ort.SessionOptions()
@@ -136,12 +137,12 @@ def create_session(model_path: Path, device: str, input_shape: tuple[int, ...], 
                 sess = make([(name, opts), "CPUExecutionProvider"], model)
                 inp = sess.get_inputs()[0]
                 sess.run(None, {inp.name: np.zeros(input_shape, dtype=np.float32)})
-                log(f"{model_path.name}：使用 {_DEVICE_LABELS.get(name, name)}（初始化 {time.time() - t0:.1f}s）")
+                log(f"{label}：使用 {_DEVICE_LABELS.get(name, name)}（初始化 {time.time() - t0:.1f}s）")
                 return sess, name
             except Exception as e:  # noqa: BLE001 — 任何失敗都改試下一個 provider
                 msg = f"{name}: {str(e).splitlines()[0][:160]}"
                 errors.append(msg)
-                log(f"⚠ {model_path.name}：GPU provider 失敗，{msg}")
+                log(f"⚠ {label}：GPU provider 失敗，{msg}")
         if not tried:
             log(f"⚠ 這個 onnxruntime 沒有 GPU provider（可用：{', '.join(sorted(available))}）")
         if device == "gpu":
@@ -149,7 +150,7 @@ def create_session(model_path: Path, device: str, input_shape: tuple[int, ...], 
                 "onnxruntime 沒有可用的 GPU provider（Windows 請安裝 onnxruntime-directml）"
             )
             sys.exit(f"GPU 初始化失敗：{detail}")
-        log(f"{model_path.name}：改用 CPU")
+        log(f"{label}：改用 CPU")
     return make(["CPUExecutionProvider"]), "CPUExecutionProvider"
 
 
@@ -182,6 +183,8 @@ def runtime_info() -> str:
 
 def device_label(detector) -> str:
     """回傳偵測器實際使用的運算裝置描述，例如「GPU（CoreML）」或「CPU」。"""
+    if isinstance(detector, RescueDetector):
+        return device_label(detector.primary)
     if isinstance(detector, UnionDetector):
         labels = {device_label(d) for d in detector.detectors}
         gpu = sorted(l for l in labels if l != "CPU")
@@ -333,19 +336,128 @@ class UnionDetector:
         return [boxes[i] for i in np.array(idxs).flatten()]
 
 
+class CloseupRescue:
+    """特寫／旋轉補救偵測器，只在主偵測器整幀沒抓到臉時啟用。
+
+    針對「臉比畫面還大、畫面橫躺 90 度、臉被裁掉一部分、動態模糊」的極端特寫（手機貼很近的自拍、
+    躺姿影片常見）：SCRFD 與頭部模型在這類畫面上分數趨近 0，轉正縮小也拉不到 0.5；但 YuNet 在
+    「轉正 + 把畫面縮小一半」後仍能給 0.5 到 0.7。做法：把畫面放進兩倍大的畫布中央（臉在偵測器
+    眼中變小），對 0 / 90 / 270 度各跑一次 YuNet，框映射回原圖座標後 NMS 聯集。
+    門檻 0.4、只用縮小一半的畫布、不含 180 度，是實測中命中率最高且在無人照片上零誤報的組合
+    （多加縮放層級只會增加誤報與時間；門檻 0.5 在 h264 壓縮後的影片幀上會漏掉邊界案例）。
+    """
+
+    ROTATIONS = {0: None, 90: cv2.ROTATE_90_CLOCKWISE, 270: cv2.ROTATE_90_COUNTERCLOCKWISE}
+    CONF = 0.4
+    SCALES = (2.0,)  # 畫布放大倍數（臉相對變小）；可設多個取聯集
+    MAX_SIDE = 1280  # 放大後的畫布長邊上限，控制 YuNet 成本
+
+    def __init__(self, conf: float | None = None, scales: tuple[float, ...] | None = None):
+        if not YUNET_MODEL.exists():
+            sys.exit(f"找不到模型檔 {YUNET_MODEL}，請先下載（見 README.md）")
+        self.conf = self.CONF if conf is None else conf
+        self.scales = self.SCALES if scales is None else scales
+        self.detector = cv2.FaceDetectorYN.create(
+            str(YUNET_MODEL), "", (320, 320), score_threshold=self.conf, nms_threshold=0.3, top_k=5000
+        )
+
+    @staticmethod
+    def _unrotate(box, rot: int, h0: int, w0: int) -> tuple[int, int, int, int]:
+        """把旋轉後影像座標的框 (x, y, w, h) 映回原圖；h0, w0 為原圖尺寸。"""
+        x, y, bw, bh = box
+        corners = [(x, y), (x + bw, y), (x, y + bh), (x + bw, y + bh)]
+        if rot == 90:      # 原 (x, y) → 順時針轉後 (h0 - y, x)
+            corners = [(py, h0 - px) for px, py in corners]
+        elif rot == 270:   # 原 (x, y) → 逆時針轉後 (y, w0 - x)
+            corners = [(w0 - py, px) for px, py in corners]
+        xs, ys = [c[0] for c in corners], [c[1] for c in corners]
+        return int(min(xs)), int(min(ys)), int(max(xs) - min(xs)), int(max(ys) - min(ys))
+
+    def detect(self, frame: np.ndarray) -> list[tuple[int, int, int, int]]:
+        h0, w0 = frame.shape[:2]
+        boxes, scores = [], []
+        for rot, code in self.ROTATIONS.items():
+            imr = frame if code is None else cv2.rotate(frame, code)
+            h, w = imr.shape[:2]
+            for scale in self.scales:
+                H, W = int(h * scale), int(w * scale)
+                oy, ox = (H - h) // 2, (W - w) // 2
+                canvas = np.full((H, W, 3), 114, dtype=np.uint8)
+                canvas[oy:oy + h, ox:ox + w] = imr
+                s = min(1.0, self.MAX_SIDE / max(H, W))
+                if s < 1.0:
+                    canvas = cv2.resize(canvas, (int(W * s), int(H * s)))
+                self.detector.setInputSize((canvas.shape[1], canvas.shape[0]))
+                _, faces = self.detector.detect(canvas)
+                if faces is None:
+                    continue
+                for f in faces:
+                    x, y, bw, bh = f[:4] / s
+                    x1, y1 = max(0.0, x - ox), max(0.0, y - oy)
+                    x2, y2 = min(float(w), x - ox + bw), min(float(h), y - oy + bh)
+                    if x2 - x1 < 8 or y2 - y1 < 8:
+                        continue
+                    boxes.append(self._unrotate((x1, y1, x2 - x1, y2 - y1), rot, h0, w0))
+                    scores.append(float(f[14]))
+        if not boxes:
+            return []
+        idxs = cv2.dnn.NMSBoxes([list(map(float, b)) for b in boxes], scores, self.conf, 0.4)
+        return [boxes[i] for i in np.array(idxs).flatten()]
+
+
+class RescueDetector:
+    """主偵測器整幀沒抓到臉時，改用 CloseupRescue 再試一次，並統計觸發／救回次數供處理紀錄使用。"""
+
+    def __init__(self, primary, rescue: CloseupRescue):
+        self.primary = primary
+        self.rescue = rescue
+        self.triggered = 0        # 主偵測沒抓到、啟用補救的幀數
+        self.rescued_frames = 0   # 補救有抓到的幀數
+        self.rescued_boxes = 0    # 補救抓到的框數
+
+    def detect(self, frame: np.ndarray) -> list[tuple[int, int, int, int]]:
+        boxes = self.primary.detect(frame)
+        if boxes:
+            return boxes
+        self.triggered += 1
+        boxes = self.rescue.detect(frame)
+        if boxes:
+            self.rescued_frames += 1
+            self.rescued_boxes += len(boxes)
+        return boxes
+
+    def stats(self) -> tuple[int, int, int]:
+        return self.triggered, self.rescued_frames, self.rescued_boxes
+
+
+def rescue_stats(detector) -> tuple[int, int, int] | None:
+    """回傳補救統計 (觸發幀數, 救回幀數, 救回框數)；偵測器沒開補救時回傳 None。"""
+    return detector.stats() if isinstance(detector, RescueDetector) else None
+
+
 def create_detector(args, log=None):
-    """依 args 建立偵測器；log(str) 會收到各模型實際使用的裝置與 GPU 初始化失敗原因。"""
+    """依 args 建立偵測器；log(str) 會收到各模型實際使用的裝置與 GPU 初始化失敗原因。
+
+    - detector=scrfd / both 時預設多尺度：det-size 高於 640 會再加一道 640 掃描取聯集。SCRFD 的
+      訓練畫布是 640、看過的臉最大約 500px，特寫大臉在高解析度掃描下會超出尺度而分數崩掉，
+      640 那道把它補回來（實測 9 張側臉照從 5 張提升到 8 張），GPU 每幀只多約 14 ms。args.multiscale=False 停用。
+    - args.rescue（預設開）：整幀沒抓到臉時用 CloseupRescue 再試一次。
+    """
     device = getattr(args, "device", "auto")
-    if args.detector == "scrfd":
-        det = ScrfdDetector(args.conf, args.det_size, device, log)
-    elif args.detector == "yunet":
-        det = YunetDetector(args.conf)
-        if log and device != "cpu":
+    parts = []
+    if args.detector in ("scrfd", "both"):
+        parts.append(ScrfdDetector(args.conf, args.det_size, device, log))
+        if getattr(args, "multiscale", True) and parts[-1].det_size > 640:
+            parts.append(ScrfdDetector(args.conf, 640, device, log))
+    if args.detector in ("yunet", "both"):
+        parts.append(YunetDetector(args.conf))
+        if log and device != "cpu" and args.detector == "yunet":
             log("YuNet 走 OpenCV DNN，只能用 CPU")
-    else:
-        det = UnionDetector([ScrfdDetector(args.conf, args.det_size, device, log), YunetDetector(args.conf)])
     if getattr(args, "head", False):
-        det = UnionDetector([det, HeadDetector(max(args.conf, 0.35), device, log)])
+        parts.append(HeadDetector(max(args.conf, 0.35), device, log))
+    det = parts[0] if len(parts) == 1 else UnionDetector(parts)
+    if getattr(args, "rescue", True):
+        det = RescueDetector(det, CloseupRescue())
     return det
 
 
@@ -523,9 +635,12 @@ def process_image(path: Path, out_path: Path, detector, args, log=print):
         log(f"⚠ 無法讀取圖片：{path}")
         return None
     t0 = time.time()
+    before = rescue_stats(detector)
     n = process_frame(img, detector, args)
     cv2.imwrite(str(out_path), img)
-    log(f"✓ {path.name} → {out_path.name}（{img.shape[1]}x{img.shape[0]}，偵測到 {n} 張人臉，{time.time() - t0:.2f}s）")
+    after = rescue_stats(detector)
+    note = "，特寫補救" if before and after and after[1] > before[1] else ""
+    log(f"✓ {path.name} → {out_path.name}（{img.shape[1]}x{img.shape[0]}，偵測到 {n} 張人臉{note}，{time.time() - t0:.2f}s）")
     return n
 
 
@@ -704,6 +819,7 @@ def _process_video_once(path, out_path, detector, args, sink: str, ffmpeg, log, 
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     stats = {"frames_read": 0, "faces": 0, "covered": 0, "cancelled": False,
              "t_decode": 0.0, "t_detect": 0.0, "t_write": 0.0}
+    rescue_before = rescue_stats(detector)
     t_start = time.time()
 
     def report(done: int):
@@ -762,6 +878,10 @@ def _process_video_once(path, out_path, detector, args, sink: str, ffmpeg, log, 
     # 各階段佔比：解碼 / 偵測 / 編碼寫入（寫入含 ffmpeg 背壓，等於編碼時間），其餘是打碼與追蹤
     parts = ", ".join(f"{k} {stats[v] / elapsed:.0%}" for k, v in
                       (("解碼", "t_decode"), ("偵測", "t_detect"), ("編碼", "t_write")))
+    rescue_after = rescue_stats(detector)
+    if rescue_before and rescue_after and rescue_after[0] > rescue_before[0]:
+        trig, rf, rb = (a - b for a, b in zip(rescue_after, rescue_before))
+        detail += f"；特寫補救觸發 {trig} 幀、救回 {rf} 幀 {rb} 框"
     log(f"✓ {path.name} → {out_path.name}（{w}x{h}，共 {written} 幀，{elapsed:.1f}s ≈ {written / elapsed:.1f} fps；"
         f"{parts}；{detail}；編碼 {writer.encoder}）")
     return written, stats["faces"]
@@ -820,6 +940,10 @@ def main():
                         help="加上頭部偵測（含背對鏡頭、極端角度），遮蔽範圍從臉擴大到整顆頭")
     parser.add_argument("--no-track", dest="track", action="store_false",
                         help="停用影片追蹤補洞，改回逐幀即時處理")
+    parser.add_argument("--no-multiscale", dest="multiscale", action="store_false",
+                        help="停用多尺度：預設 det-size 高於 640 時會再加一道 640 掃描取聯集，補特寫大臉")
+    parser.add_argument("--no-rescue", dest="rescue", action="store_false",
+                        help="停用特寫／旋轉補救：預設整幀沒抓到臉時，用 YuNet 對 0/90/270 度、縮小畫布再試一次")
     parser.add_argument("--device", choices=DEVICE_CHOICES, default="auto",
                         help="偵測運算裝置：auto 有 GPU 就用（macOS CoreML / Windows DirectML）、"
                              "不行自動退回 CPU；gpu 強制用 GPU（不可用時報錯）")
