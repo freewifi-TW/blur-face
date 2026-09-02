@@ -6,8 +6,11 @@
 """
 
 import argparse
+import gc
 import sys
+import time
 import traceback
+from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QThread, QUrl, Signal
@@ -15,12 +18,12 @@ from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QFileDialog, QGridLayout, QGroupBox,
     QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMainWindow,
-    QMessageBox, QProgressBar, QPushButton, QSlider, QVBoxLayout, QWidget,
+    QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QSlider, QVBoxLayout, QWidget,
 )
 
 from blur_faces import (
     IMAGE_EXTS, VIDEO_EXTS, create_detector, default_output, device_label,
-    pick_encoder, process_image, process_video,
+    pick_encoder, process_image, process_video, runtime_info,
 )
 
 MEDIA_EXTS = IMAGE_EXTS | VIDEO_EXTS
@@ -70,30 +73,49 @@ class Worker(QThread):
     sig_overall = Signal(int)          # 整體進度 0-100
     sig_done = Signal(str)             # 完成總結
     sig_status = Signal(str)           # 狀態列文字（實際使用的裝置 / 編碼器）
+    sig_log = Signal(str)              # 處理紀錄（一行一則）
 
-    def __init__(self, files: list[Path], args: argparse.Namespace, out_dir: Path | None):
+    def __init__(self, files: list[Path], args: argparse.Namespace, out_dir: Path | None, detector=None):
         super().__init__()
         self.files = files
         self.args = args
         self.out_dir = out_dir
         self.cancelled = False
+        # 設定沒變時沿用上一輪的偵測器：每輪重建 GPU session 會累積未釋放的顯示卡資源，
+        # 幾輪後 DirectML 初始化失敗、默默退回 CPU（症狀：GPU 0%、CPU 飆高、速度極慢）
+        self.detector = detector
 
     def cancel(self):
         self.cancelled = True
 
     def run(self):
+        log = self.sig_log.emit
         try:
-            detector = create_detector(self.args)
+            if self.detector is None:
+                t0 = time.time()
+                self.detector = create_detector(self.args, log=log)
+                log(f"偵測器就緒（{time.time() - t0:.1f}s），裝置：{device_label(self.detector)}")
+            else:
+                log(f"沿用上一輪的偵測器，裝置：{device_label(self.detector)}")
         except SystemExit as e:
+            log(f"✗ 偵測器建立失敗：{e}")
             self.sig_done.emit(f"錯誤：{e}")
             return
-        status = f"偵測 {device_label(detector)}"
+        detector = self.detector
+        dev = device_label(detector)
+        status = f"偵測 {dev}"
+        if self.args.device != "cpu" and dev == "CPU":
+            status += "（GPU 不可用，見處理紀錄）"
+            log("⚠ 已勾選 GPU 加速但這輪沒有用到 GPU，偵測改在 CPU 執行，速度會慢很多；重開程式通常可恢復")
         if any(p.suffix.lower() in VIDEO_EXTS for p in self.files):
             try:
-                status += f" · 編碼 {pick_encoder(self.args.encoder)[0]}"
+                encoder = pick_encoder(self.args.encoder)[0]
             except SystemExit as e:
+                log(f"✗ {e}")
                 self.sig_done.emit(f"錯誤：{e}")
                 return
+            status += f" · 編碼 {encoder}"
+            log(f"影片編碼器：{encoder}")
         self.sig_status.emit(f"處理中…（{status}）")
 
         n_files = len(self.files)
@@ -116,7 +138,7 @@ class Worker(QThread):
                 if path.suffix.lower() in VIDEO_EXTS:
                     result = process_video(
                         path, out, detector, self.args,
-                        log=lambda *_: None, progress=progress,
+                        log=log, progress=progress,
                         cancel=lambda: self.cancelled,
                     )
                     if result is None:
@@ -124,7 +146,7 @@ class Worker(QThread):
                     frames, faces = result
                     self.sig_item.emit(i, f"✓ {faces} 次人臉偵測 / {frames} 幀")
                 else:
-                    faces = process_image(path, out, detector, self.args, log=lambda *_: None)
+                    faces = process_image(path, out, detector, self.args, log=log)
                     if faces is None:
                         raise RuntimeError("無法讀取")
                     self.sig_item.emit(i, f"✓ {faces} 張人臉")
@@ -132,6 +154,7 @@ class Worker(QThread):
                 total_faces += faces
             except Exception as e:
                 fail += 1
+                log(f"✗ {path.name}：{e}")
                 self.sig_item.emit(i, f"✗ {e}")
             self.sig_overall.emit(int((i + 1) / n_files * 100))
 
@@ -148,10 +171,13 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Blur Face — AI 人臉打碼")
-        self.resize(680, 600)
+        self.resize(680, 780)
         self.files: list[Path] = []
         self.worker: Worker | None = None
         self.out_dir: Path | None = None
+        self.cached_detector = None   # 跨輪沿用的偵測器（見 Worker.__init__ 說明）；self.detector 是下拉選單
+        self.detector_key = None      # 建立該偵測器時的設定，設定變了才重建
+        self.logged_env = False
 
         root = QWidget()
         self.setCentralWidget(root)
@@ -294,6 +320,27 @@ class MainWindow(QMainWindow):
         self.progress.setValue(0)
         layout.addWidget(self.progress)
 
+        # --- 處理紀錄 ---
+        log_box = QGroupBox("處理紀錄（每個檔案的耗時、使用的裝置與編碼器；遇到問題可複製回報）")
+        log_layout = QVBoxLayout(log_box)
+        self.log = QPlainTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setMaximumBlockCount(5000)
+        self.log.setFixedHeight(150)
+        self.log.setLineWrapMode(QPlainTextEdit.NoWrap)
+        self.log.setStyleSheet("font-family: Menlo, Consolas, 'Courier New', monospace; font-size: 11px;")
+        log_layout.addWidget(self.log)
+        log_btns = QHBoxLayout()
+        log_btns.addStretch(1)
+        copy_btn = QPushButton("複製紀錄")
+        copy_btn.clicked.connect(lambda: QApplication.clipboard().setText(self.log.toPlainText()))
+        clear_btn = QPushButton("清除紀錄")
+        clear_btn.clicked.connect(self.log.clear)
+        log_btns.addWidget(copy_btn)
+        log_btns.addWidget(clear_btn)
+        log_layout.addLayout(log_btns)
+        layout.addWidget(log_box)
+
         ctrl = QHBoxLayout()
         self.status = QLabel("就緒")
         ctrl.addWidget(self.status, stretch=1)
@@ -366,6 +413,9 @@ class MainWindow(QMainWindow):
             encoder="auto" if self.hw_encode.isChecked() else "software",
         )
 
+    def append_log(self, text: str):
+        self.log.appendPlainText(f"[{datetime.now():%H:%M:%S}] {text}")
+
     def start(self):
         if not self.files:
             QMessageBox.information(self, "沒有檔案", "請先加入照片或影片")
@@ -373,11 +423,28 @@ class MainWindow(QMainWindow):
         self.set_busy(True)
         self.progress.setValue(0)
         self.status.setText("處理中…")
-        self.worker = Worker(list(self.files), self.build_args(), self.out_dir)
+        args = self.build_args()
+        if not self.logged_env:
+            self.append_log(runtime_info())
+            self.logged_env = True
+        self.append_log(
+            f"開始處理 {len(self.files)} 個檔案 · 偵測器 {args.detector} · 解析度 {args.det_size} · "
+            f"門檻 {args.conf:.2f} · 頭部 {'開' if args.head else '關'} · 追蹤 {'開' if args.track else '關'} · "
+            f"裝置 {args.device} · 編碼 {args.encoder} · 輸出 {self.out_dir or '原檔旁'}"
+        )
+        key = (args.detector, args.det_size, args.conf, args.head, args.device)
+        if key != self.detector_key:
+            if self.cached_detector is not None:
+                self.append_log("偵測設定已變更，釋放舊偵測器後重建")
+            self.cached_detector = None
+            self.detector_key = key
+            gc.collect()  # 先把舊 session 的 GPU 資源還回去，再建新的
+        self.worker = Worker(list(self.files), args, self.out_dir, self.cached_detector)
         self.worker.sig_item.connect(self.on_item)
         self.worker.sig_overall.connect(self.progress.setValue)
         self.worker.sig_done.connect(self.on_done)
         self.worker.sig_status.connect(self.status.setText)
+        self.worker.sig_log.connect(self.append_log)
         self.worker.start()
 
     def cancel(self):
@@ -389,8 +456,20 @@ class MainWindow(QMainWindow):
         self.list.item(row).setText(f"{self.files[row].name} — {text}")
 
     def on_done(self, summary: str):
+        if self.worker is not None:
+            self.cached_detector = self.worker.detector  # 留給下一輪沿用
+        self.append_log(summary)
         self.status.setText(summary)
         self.set_busy(False)
+
+    def closeEvent(self, event):
+        """關閉視窗時先取消並等待背景處理結束，避免留下佔著 GPU 記憶體的殭屍程序與 ffmpeg 子程序。"""
+        if self.worker is not None and self.worker.isRunning():
+            self.worker.cancel()
+            self.status.setText("正在停止背景處理…")
+            self.worker.wait(30_000)
+        self.cached_detector = None
+        event.accept()
 
     def set_busy(self, busy: bool):
         self.start_btn.setEnabled(not busy)

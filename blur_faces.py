@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from collections import deque
 from pathlib import Path
 
@@ -99,13 +100,16 @@ def _static_shape_model(model_path: Path, shape: tuple[int, ...]) -> bytes | Non
     return model.SerializeToString()
 
 
-def create_session(model_path: Path, device: str, input_shape: tuple[int, ...]):
+def create_session(model_path: Path, device: str, input_shape: tuple[int, ...], log=None):
     """建立 onnxruntime 推論 session，回傳 (session, provider 名稱)。
 
     device="auto" / "gpu" 時依序嘗試本機可用的 GPU provider；每個都先用零輸入實際推論一次
     （CoreML 的不相容要到第一次推論才會爆）。全部失敗時 auto 退回 CPU，gpu 直接報錯。
+    log(str) 會收到每個 provider 的嘗試結果，方便事後判斷為什麼沒用到 GPU。
     """
     import onnxruntime as ort
+
+    log = log or (lambda *_: None)
 
     def make(providers, model=None):
         so = ort.SessionOptions()
@@ -121,23 +125,59 @@ def create_session(model_path: Path, device: str, input_shape: tuple[int, ...]):
     if device != "cpu":
         available = set(ort.get_available_providers())
         errors = []
+        tried = False
         for name, opts in _GPU_PROVIDERS:
             if name not in available:
                 continue
+            tried = True
             try:
+                t0 = time.time()
                 model = _static_shape_model(model_path, input_shape)
                 sess = make([(name, opts), "CPUExecutionProvider"], model)
                 inp = sess.get_inputs()[0]
                 sess.run(None, {inp.name: np.zeros(input_shape, dtype=np.float32)})
+                log(f"{model_path.name}：使用 {_DEVICE_LABELS.get(name, name)}（初始化 {time.time() - t0:.1f}s）")
                 return sess, name
             except Exception as e:  # noqa: BLE001 — 任何失敗都改試下一個 provider
-                errors.append(f"{name}: {str(e).splitlines()[0][:160]}")
+                msg = f"{name}: {str(e).splitlines()[0][:160]}"
+                errors.append(msg)
+                log(f"⚠ {model_path.name}：GPU provider 失敗，{msg}")
+        if not tried:
+            log(f"⚠ 這個 onnxruntime 沒有 GPU provider（可用：{', '.join(sorted(available))}）")
         if device == "gpu":
             detail = "；".join(errors) if errors else (
                 "onnxruntime 沒有可用的 GPU provider（Windows 請安裝 onnxruntime-directml）"
             )
             sys.exit(f"GPU 初始化失敗：{detail}")
+        log(f"{model_path.name}：改用 CPU")
     return make(["CPUExecutionProvider"]), "CPUExecutionProvider"
+
+
+def runtime_info() -> str:
+    """一行執行環境摘要（給 log 用）：onnxruntime 版本與 provider、OpenCV 版本、ffmpeg 路徑。"""
+    import platform
+
+    try:
+        import onnxruntime as ort
+
+        ort_info = f"onnxruntime {ort.__version__}（{', '.join(ort.get_available_providers())}）"
+    except Exception as e:  # noqa: BLE001
+        ort_info = f"onnxruntime 無法載入：{e}"
+    gpu_info = ""
+    if sys.platform == "win32":
+        # 列出顯示卡型號與驅動版本，判斷 DirectML 用的是哪張卡（雙顯卡筆電）與 VRAM 是否夠
+        try:
+            out = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "Get-CimInstance Win32_VideoController | ForEach-Object { $_.Name + ' (驅動 ' + $_.DriverVersion + ')' }"],
+                capture_output=True, text=True, timeout=10, **_subprocess_kwargs(),
+            ).stdout
+            gpus = [l.strip() for l in out.splitlines() if l.strip()]
+            gpu_info = f" · 顯示卡 {' / '.join(gpus) or '未知'}"
+        except Exception:  # noqa: BLE001
+            gpu_info = " · 顯示卡 查詢失敗"
+    return (f"{platform.system()} {platform.release()} · Python {platform.python_version()} · "
+            f"{ort_info} · OpenCV {cv2.__version__} · ffmpeg {find_ffmpeg() or '無'}{gpu_info}")
 
 
 def device_label(detector) -> str:
@@ -160,13 +200,13 @@ class ScrfdDetector:
     NUM_ANCHORS = 2
     NMS_IOU = 0.4
 
-    def __init__(self, conf: float, det_size: int, device: str = "auto"):
+    def __init__(self, conf: float, det_size: int, device: str = "auto", log=None):
         if not SCRFD_MODEL.exists():
             sys.exit(f"找不到模型檔 {SCRFD_MODEL}，請先下載（見 README.md）")
         self.conf = conf
         self.det_size = max(64, (det_size + 31) // 32 * 32)  # 需為 32 的倍數
         self.session, self.provider = create_session(
-            SCRFD_MODEL, device, (1, 3, self.det_size, self.det_size)
+            SCRFD_MODEL, device, (1, 3, self.det_size, self.det_size), log
         )
         self.input_name = self.session.get_inputs()[0].name
         self.output_names = [o.name for o in self.session.get_outputs()]
@@ -249,10 +289,10 @@ class HeadDetector:
     INPUT = 640
     NMS_IOU = 0.45
 
-    def __init__(self, conf: float, device: str = "auto"):
+    def __init__(self, conf: float, device: str = "auto", log=None):
         if not HEAD_MODEL.exists():
             sys.exit(f"找不到模型檔 {HEAD_MODEL}，請先下載（見 README.md）")
-        self.session, self.provider = create_session(HEAD_MODEL, device, (1, 3, self.INPUT, self.INPUT))
+        self.session, self.provider = create_session(HEAD_MODEL, device, (1, 3, self.INPUT, self.INPUT), log)
         self.input_name = self.session.get_inputs()[0].name
         self.conf = conf
 
@@ -293,16 +333,19 @@ class UnionDetector:
         return [boxes[i] for i in np.array(idxs).flatten()]
 
 
-def create_detector(args):
+def create_detector(args, log=None):
+    """依 args 建立偵測器；log(str) 會收到各模型實際使用的裝置與 GPU 初始化失敗原因。"""
     device = getattr(args, "device", "auto")
     if args.detector == "scrfd":
-        det = ScrfdDetector(args.conf, args.det_size, device)
+        det = ScrfdDetector(args.conf, args.det_size, device, log)
     elif args.detector == "yunet":
         det = YunetDetector(args.conf)
+        if log and device != "cpu":
+            log("YuNet 走 OpenCV DNN，只能用 CPU")
     else:
-        det = UnionDetector([ScrfdDetector(args.conf, args.det_size, device), YunetDetector(args.conf)])
+        det = UnionDetector([ScrfdDetector(args.conf, args.det_size, device, log), YunetDetector(args.conf)])
     if getattr(args, "head", False):
-        det = UnionDetector([det, HeadDetector(max(args.conf, 0.35), device)])
+        det = UnionDetector([det, HeadDetector(max(args.conf, 0.35), device, log)])
     return det
 
 
@@ -479,9 +522,10 @@ def process_image(path: Path, out_path: Path, detector, args, log=print):
     if img is None:
         log(f"⚠ 無法讀取圖片：{path}")
         return None
+    t0 = time.time()
     n = process_frame(img, detector, args)
     cv2.imwrite(str(out_path), img)
-    log(f"✓ {path.name} → {out_path.name}（偵測到 {n} 張人臉）")
+    log(f"✓ {path.name} → {out_path.name}（{img.shape[1]}x{img.shape[0]}，偵測到 {n} 張人臉，{time.time() - t0:.2f}s）")
     return n
 
 
@@ -618,16 +662,22 @@ def _iter_censored_frames(cap, detector, args, cancel, stats: dict, report):
         if cancel is not None and cancel():
             stats["cancelled"] = True
             return
+        t0 = time.time()
         ok, frame = cap.read()
+        stats["t_decode"] += time.time() - t0
         if not ok:
             break
         stats["frames_read"] += 1
         report(stats["frames_read"])
         if tracker is None:
+            t0 = time.time()
             stats["faces"] += process_frame(frame, detector, args, sticky)
+            stats["t_detect"] += time.time() - t0
             yield frame
             continue
+        t0 = time.time()
         boxes = detector.detect(frame)
+        stats["t_detect"] += time.time() - t0
         stats["faces"] += len(boxes)
         for out_frame, out_boxes in tracker.push(frame, boxes):
             stats["covered"] += len(out_boxes)
@@ -652,7 +702,9 @@ def _process_video_once(path, out_path, detector, args, sink: str, ffmpeg, log, 
         return None
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    stats = {"frames_read": 0, "faces": 0, "covered": 0, "cancelled": False}
+    stats = {"frames_read": 0, "faces": 0, "covered": 0, "cancelled": False,
+             "t_decode": 0.0, "t_detect": 0.0, "t_write": 0.0}
+    t_start = time.time()
 
     def report(done: int):
         if progress is not None:
@@ -674,7 +726,9 @@ def _process_video_once(path, out_path, detector, args, sink: str, ffmpeg, log, 
                     writer = _FfmpegWriter(ffmpeg, out_path, path, fps, (w, h), encoder)
                 else:
                     writer = _Cv2Writer(out_path, fps, (w, h))
+            t0 = time.time()
             writer.write(frame)
+            stats["t_write"] += time.time() - t0
             written += 1
     except (BrokenPipeError, OSError) as e:
         error = str(e)
@@ -704,7 +758,12 @@ def _process_video_once(path, out_path, detector, args, sink: str, ffmpeg, log, 
         detail = f"偵測 {stats['faces']} 次，追蹤補齊後遮蔽 {stats['covered']} 次"
     else:
         detail = f"累計偵測 {stats['faces']} 次人臉"
-    log(f"✓ {path.name} → {out_path.name}（共 {written} 幀，{detail}，編碼 {writer.encoder}）")
+    elapsed = time.time() - t_start
+    # 各階段佔比：解碼 / 偵測 / 編碼寫入（寫入含 ffmpeg 背壓，等於編碼時間），其餘是打碼與追蹤
+    parts = ", ".join(f"{k} {stats[v] / elapsed:.0%}" for k, v in
+                      (("解碼", "t_decode"), ("偵測", "t_detect"), ("編碼", "t_write")))
+    log(f"✓ {path.name} → {out_path.name}（{w}x{h}，共 {written} 幀，{elapsed:.1f}s ≈ {written / elapsed:.1f} fps；"
+        f"{parts}；{detail}；編碼 {writer.encoder}）")
     return written, stats["faces"]
 
 
@@ -773,7 +832,8 @@ def main():
     if not in_path.exists():
         sys.exit(f"找不到輸入：{in_path}")
 
-    detector = create_detector(args)
+    print(runtime_info())
+    detector = create_detector(args, log=print)
     print(f"偵測裝置：{device_label(detector)}")
 
     if in_path.is_dir():
