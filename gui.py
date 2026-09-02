@@ -19,8 +19,8 @@ from PySide6.QtWidgets import (
 )
 
 from blur_faces import (
-    IMAGE_EXTS, VIDEO_EXTS, create_detector, default_output,
-    process_image, process_video,
+    IMAGE_EXTS, VIDEO_EXTS, create_detector, default_output, device_label,
+    pick_encoder, process_image, process_video,
 )
 
 MEDIA_EXTS = IMAGE_EXTS | VIDEO_EXTS
@@ -69,6 +69,7 @@ class Worker(QThread):
     sig_item = Signal(int, str)        # (row, 狀態文字)
     sig_overall = Signal(int)          # 整體進度 0-100
     sig_done = Signal(str)             # 完成總結
+    sig_status = Signal(str)           # 狀態列文字（實際使用的裝置 / 編碼器）
 
     def __init__(self, files: list[Path], args: argparse.Namespace, out_dir: Path | None):
         super().__init__()
@@ -86,6 +87,14 @@ class Worker(QThread):
         except SystemExit as e:
             self.sig_done.emit(f"錯誤：{e}")
             return
+        status = f"偵測 {device_label(detector)}"
+        if any(p.suffix.lower() in VIDEO_EXTS for p in self.files):
+            try:
+                status += f" · 編碼 {pick_encoder(self.args.encoder)[0]}"
+            except SystemExit as e:
+                self.sig_done.emit(f"錯誤：{e}")
+                return
+        self.sig_status.emit(f"處理中…（{status}）")
 
         n_files = len(self.files)
         ok = fail = total_faces = 0
@@ -139,7 +148,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Blur Face — AI 人臉打碼")
-        self.resize(680, 560)
+        self.resize(680, 600)
         self.files: list[Path] = []
         self.worker: Worker | None = None
         self.out_dir: Path | None = None
@@ -251,6 +260,24 @@ class MainWindow(QMainWindow):
         )
         grid.addWidget(self.track, 3, 2)
 
+        self.gpu = QCheckBox("GPU 加速偵測")
+        self.gpu.setChecked(True)
+        self.gpu.setToolTip(
+            "用 GPU 跑人臉 / 頭部偵測模型（macOS 走 CoreML、Windows 走 DirectML，內顯也可以）\n"
+            "比 CPU 快約 4–6 倍；沒有可用 GPU 時自動改用 CPU，偵測結果完全相同\n"
+            "開始處理後狀態列會顯示實際使用的裝置"
+        )
+        grid.addWidget(self.gpu, 4, 0, 1, 2)
+
+        self.hw_encode = QCheckBox("硬體編碼影片")
+        self.hw_encode.setChecked(True)
+        self.hw_encode.setToolTip(
+            "影片輸出改用顯示卡 / 媒體引擎的 H.264 編碼器（VideoToolbox、NVENC、QSV、AMF）\n"
+            "編碼速度快很多，畫質略低於軟體編碼 libx264；沒有可用硬體時自動改用 libx264\n"
+            "追求最高畫質可關閉"
+        )
+        grid.addWidget(self.hw_encode, 4, 2)
+
         self.out_btn = QPushButton("輸出資料夾：原檔旁（點擊變更）")
         self.out_btn.setToolTip(
             "處理結果的存放位置，原始檔案永遠不會被修改\n"
@@ -258,7 +285,7 @@ class MainWindow(QMainWindow):
             "點擊可改成統一輸出到你指定的資料夾"
         )
         self.out_btn.clicked.connect(self.pick_out_dir)
-        grid.addWidget(self.out_btn, 4, 0, 1, 5)
+        grid.addWidget(self.out_btn, 5, 0, 1, 5)
 
         layout.addWidget(opts)
 
@@ -335,6 +362,8 @@ class MainWindow(QMainWindow):
             ellipse=self.ellipse.isChecked(),
             head=self.head.isChecked(),
             track=self.track.isChecked(),
+            device="auto" if self.gpu.isChecked() else "cpu",
+            encoder="auto" if self.hw_encode.isChecked() else "software",
         )
 
     def start(self):
@@ -348,6 +377,7 @@ class MainWindow(QMainWindow):
         self.worker.sig_item.connect(self.on_item)
         self.worker.sig_overall.connect(self.progress.setValue)
         self.worker.sig_done.connect(self.on_done)
+        self.worker.sig_status.connect(self.status.setText)
         self.worker.start()
 
     def cancel(self):
@@ -365,23 +395,24 @@ class MainWindow(QMainWindow):
     def set_busy(self, busy: bool):
         self.start_btn.setEnabled(not busy)
         self.cancel_btn.setEnabled(busy)
-        for w in (self.mode, self.strength, self.detector, self.det_size,
-                  self.conf, self.ellipse, self.head, self.track, self.out_btn):
+        for w in (self.mode, self.strength, self.detector, self.det_size, self.conf,
+                  self.ellipse, self.head, self.track, self.gpu, self.hw_encode, self.out_btn):
             w.setEnabled(not busy)
 
 
 def smoke_test() -> int:
-    """打包後的自我檢查：模型載入、偵測、ffmpeg 都正常才回傳 0。"""
+    """打包後的自我檢查：模型載入（含 GPU provider 探測）、偵測、ffmpeg 與編碼器探測都正常才回傳 0。"""
     import numpy as np
-    from blur_faces import ScrfdDetector, find_ffmpeg
+    from blur_faces import find_ffmpeg
 
     app = QApplication(sys.argv)
     win = MainWindow()  # noqa: F841 確認 UI 可建立
-    det = ScrfdDetector(conf=0.4, det_size=640)
+    det = create_detector(argparse.Namespace(detector="scrfd", conf=0.4, det_size=640, head=True, device="auto"))
     det.detect(np.zeros((480, 640, 3), dtype=np.uint8))
     assert find_ffmpeg(), "找不到 ffmpeg"
+    encoder = pick_encoder("auto")[0]
     if sys.stdout is not None:  # Windows --windowed 模式下 stdout 為 None
-        print("SMOKE OK")
+        print(f"SMOKE OK  偵測裝置={device_label(det)}  編碼器={encoder}")
     return 0
 
 

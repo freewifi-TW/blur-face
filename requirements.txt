@@ -1,5 +1,10 @@
 opencv-python>=4.10
 numpy
-onnxruntime>=1.20
+# 偵測推論引擎：Windows 用 DirectML 版（GPU 加速，NVIDIA/AMD/Intel 含內顯皆可，不需 CUDA）；
+# macOS 的標準版已內含 CoreML provider。兩者 import 名稱都是 onnxruntime，不能同時安裝。
+onnxruntime>=1.20; sys_platform != "win32"
+onnxruntime-directml>=1.20; sys_platform == "win32"
+# 把 SCRFD 的動態輸入尺寸固定成靜態，CoreML / DirectML 才能整張圖丟 GPU
+onnx>=1.16
 PySide6>=6.8
 imageio-ffmpeg>=0.5

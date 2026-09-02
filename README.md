@@ -7,7 +7,9 @@
 進階遮蔽能力：
 
 - **頭部偵測**（`--head` / GUI 勾選）：加掛 CrowdHuman YOLOv5m 頭部模型，**背對鏡頭、極端角度的人也會被遮蔽**（從「遮臉」升級為「遮頭」）
-- **影片追蹤補洞**（預設開啟，`--no-track` 停用）：兩段式處理 — 全片偵測後把同一個人串成時間軸軌跡，短暫漏偵測的幀用前後幀線性內插補齊，並向軌跡前後延伸，消除馬賽克閃爍與漏幀
+- **影片追蹤補洞**（預設開啟，`--no-track` 停用）：邊偵測邊把同一個人串成時間軸軌跡，短暫漏偵測的幀用前後幀線性內插補齊，並向軌跡前後延伸，消除馬賽克閃爍與漏幀；線上演算法只需暫存十幾幀，影片只解碼一遍
+- **GPU 加速**（預設自動，`--device` 控制）：偵測在 macOS 走 CoreML、Windows 走 DirectML（NVIDIA / AMD / Intel 內顯皆可，不需裝 CUDA），M4 實測偵測快 4 倍、整體快 3.4 倍，結果與 CPU 完全相同；沒有可用 GPU 自動退回 CPU
+- **硬體編碼**（預設自動，`--encoder` 控制）：影片畫面直接串流進 ffmpeg 一次完成編碼與音軌合併，不再經過中間檔重複壓縮；可用時改用 VideoToolbox / NVENC / QSV / AMF 硬體編碼器
 
 提供三種使用方式：**桌面 App（GUI）**、**命令列（CLI）**、Python 模組。
 
@@ -18,7 +20,7 @@
 .venv/bin/python gui.py
 ```
 
-拖放檔案或資料夾 → 調整設定 → 開始處理。支援批次、即時進度、中途取消。
+拖放檔案或資料夾 → 調整設定 → 開始處理。支援批次、即時進度、中途取消。「GPU 加速偵測」與「硬體編碼影片」預設開啟，開始處理後狀態列會顯示實際使用的裝置與編碼器。
 
 ### 打包成應用程式
 
@@ -42,6 +44,7 @@ PyInstaller 無法跨平台編譯，macOS 版要在 Mac 上建、Windows 版要�
 
 - Python 3.10+（已在 3.14 測試）
 - ffmpeg 不用另外裝（內建 imageio-ffmpeg 靜態版；系統有裝會優先用系統版）
+- GPU 加速不用另外裝：macOS 用系統內建 CoreML；Windows 由 `requirements.txt` 依平台自動改裝 `onnxruntime-directml`，任何支援 DirectX 12 的顯示卡（含內顯）都能用
 
 ## 安裝
 
@@ -83,6 +86,9 @@ curl -L -o models/face_detection_yunet_2023mar.onnx \
 
 # 極端場景追求最高召回：雙偵測器聯集 + 頭部偵測 + 低門檻 + 高偵測解析度
 .venv/bin/python blur_faces.py photo.jpg --detector both --head --conf 0.3 --det-size 1920
+
+# 強制只用 CPU 偵測、libx264 軟體編碼（例如要排除 GPU 因素，或追求最高畫質）
+.venv/bin/python blur_faces.py video.mp4 --device cpu --encoder software
 ```
 
 ## 參數
@@ -97,7 +103,9 @@ curl -L -o models/face_detection_yunet_2023mar.onnx \
 | `--conf` | `0.4` | 偵測信心門檻；漏抓調低（如 0.3）、誤抓調高 |
 | `--pad` | `0.15` | 偵測框向外擴張比例 |
 | `--head` | 關 | 加上頭部偵測（含背對鏡頭），遮蔽範圍從臉擴大到整顆頭 |
-| `--no-track` | （追蹤預設開） | 停用影片兩段式追蹤補洞，改回逐幀即時處理 |
+| `--no-track` | （追蹤預設開） | 停用影片追蹤補洞，改回逐幀即時處理 |
+| `--device` | `auto` | 偵測運算裝置：`auto` 有 GPU 就用、不行退回 CPU / `cpu` / `gpu`（不可用時報錯） |
+| `--encoder` | `auto` | 影片編碼器：`auto` 有硬體編碼器就用、否則 libx264 / `software` 一律 libx264 / `hardware`（不可用時報錯） |
 | `--keep` | `4` | 逐幀模式下偵測框延續幀數（追蹤模式不使用） |
 | `--ellipse` | 關 | 橢圓形遮罩（預設矩形） |
 
@@ -112,9 +120,30 @@ curl -L -o models/face_detection_yunet_2023mar.onnx \
 | 側臉（2 張真實側臉照） | — | 全中 |
 | 背對鏡頭人群（GT 15+ 顆頭） | 2（純臉部） | **21**（開 `--head`） |
 
-速度（單幀偵測）：SCRFD `--det-size 1280` 約 275ms、`640` 約 76ms；YuNet 約 15ms。
+### 速度（Apple M4）
+
+單幀偵測（含前處理，1080p 輸入）：
+
+| 模型 | CPU | GPU（CoreML） |
+|---|---|---|
+| SCRFD `--det-size 1280` | 234 ms | 60 ms |
+| SCRFD `--det-size 640` | 64 ms | 14 ms |
+| 頭部 YOLOv5m（`--head`） | 105 ms | 30 ms |
+| YuNet | 18 ms | —（OpenCV DNN 只跑 CPU） |
+
+12 秒 720p 影片端對端（`--head`，預設 1280）：
+
+| 設定 | 耗時 |
+|---|---|
+| 舊版（CPU、影片解碼兩遍、mp4v + libx264 雙重編碼） | 128 s |
+| `--device cpu --encoder software` | 126 s |
+| `--device auto --encoder software` | 42 s |
+| `--device auto --encoder auto`（預設） | 37 s |
+
+四種設定的偵測次數與遮蔽次數完全相同。偵測仍是主要瓶頸，硬體編碼在 720p 差異不大，4K 才明顯。
 
 ## 注意事項
 
 - 嚴重模糊、極小的臉仍可能漏偵測。機敏內容建議開啟 `--head`（連背對鏡頭的頭都遮），並用 `--detector both --conf 0.3` 拉滿召回率，**發布前抽查輸出結果**。
 - 馬賽克 / 模糊在理論上有被還原的風險，對機敏內容可搭配較高 `--strength`。
+- 硬體編碼器（預設 `auto`）速度快，但同檔案大小下畫質略低於 libx264，且各家畫質參數不完全對齊；對畫質有要求可用 `--encoder software`。

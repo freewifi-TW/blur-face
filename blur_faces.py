@@ -3,7 +3,8 @@
 
 人臉偵測預設使用 SCRFD-10G（InsightFace）模型，對側臉、小臉、遮擋臉有高召回率；
 另提供輕量的 YuNet 與兩者聯集（both）模式。全程離線處理，檔案不會上傳。
-影片處理完成後若系統有 ffmpeg，會自動把原始音軌接回輸出檔。
+偵測預設自動使用 GPU（macOS CoreML / Windows DirectML），影片編碼可用硬體編碼器；
+影片處理完成後若有 ffmpeg，會直接把原始音軌接回輸出檔。
 """
 
 import argparse
@@ -11,10 +12,12 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from collections import deque
 from pathlib import Path
 
 import cv2
 import numpy as np
+
 
 def resource_path(rel: str) -> Path:
     """開發時相對於原始碼；PyInstaller 打包後相對於解包目錄。"""
@@ -34,6 +37,11 @@ def find_ffmpeg() -> str | None:
         return None
 
 
+def _subprocess_kwargs() -> dict:
+    """Windows 的 GUI 程式啟動 console 子程序會閃出主控台視窗，加旗標隱藏。"""
+    return {"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == "win32" else {}
+
+
 MODELS_DIR = resource_path("models")
 SCRFD_MODEL = MODELS_DIR / "det_10g.onnx"
 YUNET_MODEL = MODELS_DIR / "face_detection_yunet_2023mar.onnx"
@@ -41,6 +49,109 @@ HEAD_MODEL = MODELS_DIR / "crowdhuman_yolov5m.onnx"
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".m4v", ".webm"}
 
+DEVICE_CHOICES = ("auto", "cpu", "gpu")
+ENCODER_CHOICES = ("auto", "software", "hardware")
+
+
+# ---------------------------------------------------------------------------
+# 推論裝置（onnxruntime execution provider）
+# ---------------------------------------------------------------------------
+
+# GPU provider 的嘗試順序與選項；只會用到本機 onnxruntime 有編進去的那些。
+_GPU_PROVIDERS = [
+    # macOS：CoreML。MLProgram + CPUAndGPU 在 M 系列實測最快、載入最短，且輸出與 CPU 完全一致；
+    # ALL 會把部分層丟給 Neural Engine，這兩個模型在 ANE 上反而更慢。
+    ("CoreMLExecutionProvider", {"ModelFormat": "MLProgram", "MLComputeUnits": "CPUAndGPU"}),
+    # Windows：DirectML（onnxruntime-directml），NVIDIA / AMD / Intel 含內顯都能用，不需另裝 CUDA。
+    ("DmlExecutionProvider", {}),
+    # 有另外裝 onnxruntime-gpu 與 CUDA 的環境。
+    ("CUDAExecutionProvider", {}),
+]
+
+_DEVICE_LABELS = {
+    "CoreMLExecutionProvider": "GPU（CoreML）",
+    "DmlExecutionProvider": "GPU（DirectML）",
+    "CUDAExecutionProvider": "GPU（CUDA）",
+    "CPUExecutionProvider": "CPU",
+}
+
+
+def _static_shape_model(model_path: Path, shape: tuple[int, ...]) -> bytes | None:
+    """把 ONNX 模型的動態輸入尺寸固定成 shape。
+
+    CoreML / DirectML 需要靜態尺寸才能把整張圖交給 GPU（SCRFD 的輸入是 [1,3,?,?]，
+    直接丟給 CoreML 會在 reshape 節點失敗）。輸入本來就是靜態時回傳 None，直接用原檔即可。
+    """
+    import onnx
+
+    model = onnx.load(str(model_path))
+    dims = model.graph.input[0].type.tensor_type.shape.dim
+    if all(d.HasField("dim_value") for d in dims):
+        return None
+    for d, v in zip(dims, shape):
+        d.ClearField("dim_param")
+        d.dim_value = v
+    del model.graph.value_info[:]  # 清掉舊的中間層形狀，讓 shape inference 依新輸入重推
+    try:
+        model = onnx.shape_inference.infer_shapes(model)
+    except Exception:
+        pass
+    return model.SerializeToString()
+
+
+def create_session(model_path: Path, device: str, input_shape: tuple[int, ...]):
+    """建立 onnxruntime 推論 session，回傳 (session, provider 名稱)。
+
+    device="auto" / "gpu" 時依序嘗試本機可用的 GPU provider；每個都先用零輸入實際推論一次
+    （CoreML 的不相容要到第一次推論才會爆）。全部失敗時 auto 退回 CPU，gpu 直接報錯。
+    """
+    import onnxruntime as ort
+
+    def make(providers, model=None):
+        so = ort.SessionOptions()
+        so.log_severity_level = 3  # 關掉無害的 shape / 節點回退警告
+        if any(isinstance(p, tuple) and p[0] == "DmlExecutionProvider" for p in providers):
+            # DirectML 不支援 memory pattern 與平行執行，官方要求關閉
+            so.enable_mem_pattern = False
+            so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        return ort.InferenceSession(
+            model if model is not None else str(model_path), sess_options=so, providers=providers
+        )
+
+    if device != "cpu":
+        available = set(ort.get_available_providers())
+        errors = []
+        for name, opts in _GPU_PROVIDERS:
+            if name not in available:
+                continue
+            try:
+                model = _static_shape_model(model_path, input_shape)
+                sess = make([(name, opts), "CPUExecutionProvider"], model)
+                inp = sess.get_inputs()[0]
+                sess.run(None, {inp.name: np.zeros(input_shape, dtype=np.float32)})
+                return sess, name
+            except Exception as e:  # noqa: BLE001 — 任何失敗都改試下一個 provider
+                errors.append(f"{name}: {str(e).splitlines()[0][:160]}")
+        if device == "gpu":
+            detail = "；".join(errors) if errors else (
+                "onnxruntime 沒有可用的 GPU provider（Windows 請安裝 onnxruntime-directml）"
+            )
+            sys.exit(f"GPU 初始化失敗：{detail}")
+    return make(["CPUExecutionProvider"]), "CPUExecutionProvider"
+
+
+def device_label(detector) -> str:
+    """回傳偵測器實際使用的運算裝置描述，例如「GPU（CoreML）」或「CPU」。"""
+    if isinstance(detector, UnionDetector):
+        labels = {device_label(d) for d in detector.detectors}
+        gpu = sorted(l for l in labels if l != "CPU")
+        return gpu[0] if gpu else "CPU"
+    return _DEVICE_LABELS.get(getattr(detector, "provider", "CPUExecutionProvider"), "CPU")
+
+
+# ---------------------------------------------------------------------------
+# 偵測器
+# ---------------------------------------------------------------------------
 
 class ScrfdDetector:
     """SCRFD-10G 偵測器（onnxruntime），高召回率，對側臉/小臉/遮擋臉表現好。"""
@@ -49,20 +160,16 @@ class ScrfdDetector:
     NUM_ANCHORS = 2
     NMS_IOU = 0.4
 
-    def __init__(self, conf: float, det_size: int):
+    def __init__(self, conf: float, det_size: int, device: str = "auto"):
         if not SCRFD_MODEL.exists():
             sys.exit(f"找不到模型檔 {SCRFD_MODEL}，請先下載（見 README.md）")
-        import onnxruntime as ort
-
-        so = ort.SessionOptions()
-        so.log_severity_level = 3  # 關閉動態輸入尺寸造成的無害 shape 警告
-        self.session = ort.InferenceSession(
-            str(SCRFD_MODEL), sess_options=so, providers=["CPUExecutionProvider"]
+        self.conf = conf
+        self.det_size = max(64, (det_size + 31) // 32 * 32)  # 需為 32 的倍數
+        self.session, self.provider = create_session(
+            SCRFD_MODEL, device, (1, 3, self.det_size, self.det_size)
         )
         self.input_name = self.session.get_inputs()[0].name
         self.output_names = [o.name for o in self.session.get_outputs()]
-        self.conf = conf
-        self.det_size = max(64, (det_size + 31) // 32 * 32)  # 需為 32 的倍數
         self._anchor_cache: dict[int, np.ndarray] = {}
 
     def _anchors(self, stride: int) -> np.ndarray:
@@ -109,9 +216,10 @@ class ScrfdDetector:
 
 
 class YunetDetector:
-    """YuNet 偵測器（OpenCV 內建），輕量快速。"""
+    """YuNet 偵測器（OpenCV 內建 DNN，只能跑 CPU），輕量快速。"""
 
     MAX_SIDE = 1280  # 偵測時長邊縮到此尺寸以內
+    provider = "CPUExecutionProvider"
 
     def __init__(self, conf: float):
         if not YUNET_MODEL.exists():
@@ -141,16 +249,10 @@ class HeadDetector:
     INPUT = 640
     NMS_IOU = 0.45
 
-    def __init__(self, conf: float):
+    def __init__(self, conf: float, device: str = "auto"):
         if not HEAD_MODEL.exists():
             sys.exit(f"找不到模型檔 {HEAD_MODEL}，請先下載（見 README.md）")
-        import onnxruntime as ort
-
-        so = ort.SessionOptions()
-        so.log_severity_level = 3
-        self.session = ort.InferenceSession(
-            str(HEAD_MODEL), sess_options=so, providers=["CPUExecutionProvider"]
-        )
+        self.session, self.provider = create_session(HEAD_MODEL, device, (1, 3, self.INPUT, self.INPUT))
         self.input_name = self.session.get_inputs()[0].name
         self.conf = conf
 
@@ -192,16 +294,21 @@ class UnionDetector:
 
 
 def create_detector(args):
+    device = getattr(args, "device", "auto")
     if args.detector == "scrfd":
-        det = ScrfdDetector(args.conf, args.det_size)
+        det = ScrfdDetector(args.conf, args.det_size, device)
     elif args.detector == "yunet":
         det = YunetDetector(args.conf)
     else:
-        det = UnionDetector([ScrfdDetector(args.conf, args.det_size), YunetDetector(args.conf)])
+        det = UnionDetector([ScrfdDetector(args.conf, args.det_size, device), YunetDetector(args.conf)])
     if getattr(args, "head", False):
-        det = UnionDetector([det, HeadDetector(max(args.conf, 0.35))])
+        det = UnionDetector([det, HeadDetector(max(args.conf, 0.35), device)])
     return det
 
+
+# ---------------------------------------------------------------------------
+# 打碼
+# ---------------------------------------------------------------------------
 
 def expand_box(box, pad: float, frame_shape) -> tuple[int, int, int, int]:
     """把偵測框往外擴 pad 比例，並裁在畫面範圍內。"""
@@ -268,6 +375,10 @@ def process_frame(frame, detector, args, sticky_boxes: list | None = None):
     return len(boxes)
 
 
+# ---------------------------------------------------------------------------
+# 影片追蹤補洞（線上版）
+# ---------------------------------------------------------------------------
+
 def _iou(a, b) -> float:
     ax, ay, aw, ah = a
     bx, by, bw, bh = b
@@ -278,55 +389,90 @@ def _iou(a, b) -> float:
     return inter / union if union > 0 else 0.0
 
 
-def build_tracks(detections, iou_thresh=0.3, max_gap=15, extend=6, n_frames=None):
-    """把逐幀偵測框串成軌跡：短暫漏偵測的幀用前後幀線性內插補齊，並向軌跡前後各延伸幾幀。
+class StreamTracker:
+    """線上版「追蹤補洞」：逐幀送進畫面與偵測框，延遲 delay 幀後吐出遮蔽框已確定的畫面。
 
-    detections: list[list[box]]，索引即幀號。回傳 dict[幀號] -> [box, ...]。
+    同一個人跨幀以 IoU 串成軌跡；軌跡中短暫漏偵測（≤ max_gap 幀）的幀用前後幀線性內插補齊，
+    軌跡起點往前、終點往後各延伸 extend 幀。結果與「全片偵測完再回頭補洞」的離線做法完全相同，
+    但只需暫存 delay 幀畫面，影片只要解碼一遍。
     """
-    tracks: list[dict] = []  # {"boxes": {幀號: box}, "last": 最後出現的幀號}
-    for idx, boxes in enumerate(detections):
-        active = [t for t in tracks if idx - t["last"] <= max_gap]
+
+    def __init__(self, iou_thresh: float = 0.3, max_gap: int = 15, extend: int = 6):
+        self.iou_thresh = iou_thresh
+        self.max_gap = max_gap
+        self.extend = extend
+        # 內插最多回頭改 max_gap-1 幀、起點延伸最多回頭 extend 幀；一條軌跡要等 max_gap 幀沒續接
+        # 才能確定結束（終點延伸），所以延遲 max_gap+1 幀後該幀的框就全部確定了。
+        self.delay = max_gap + 1
+        self.tracks: list[dict] = []        # {"boxes": {幀號: box}, "last": 最後偵測到的幀號}
+        self.pending: deque = deque()       # 尚未輸出的 (幀號, 畫面)
+        self.boxes: dict[int, list] = {}    # 幀號 -> 已確定的遮蔽框（偵測 + 內插 + 起點延伸）
+        self.idx = 0
+
+    def push(self, frame: np.ndarray, detections: list) -> list[tuple[np.ndarray, list]]:
+        """送入一幀與其偵測框，回傳此時已確定、可輸出的 [(畫面, 遮蔽框), ...]。"""
+        idx = self.idx
+        self.idx += 1
+        self.pending.append((idx, frame))
+        frame_boxes = self.boxes.setdefault(idx, [])
+
+        active = [t for t in self.tracks if idx - t["last"] <= self.max_gap]
         pairs = sorted(
             ((_iou(t["boxes"][t["last"]], b), ti, bi)
-             for ti, t in enumerate(active) for bi, b in enumerate(boxes)),
+             for ti, t in enumerate(active) for bi, b in enumerate(detections)),
             reverse=True,
         )
         used_t, used_b = set(), set()
         for iou_v, ti, bi in pairs:
-            if iou_v < iou_thresh:
+            if iou_v < self.iou_thresh:
                 break
             if ti in used_t or bi in used_b:
                 continue
-            active[ti]["boxes"][idx] = boxes[bi]
-            active[ti]["last"] = idx
+            t, box = active[ti], detections[bi]
+            a, box_a = t["last"], t["boxes"][t["last"]]
+            for i in range(a + 1, idx):  # 漏偵測的幀：線性內插
+                w = (i - a) / (idx - a)
+                self.boxes[i].append(tuple(
+                    int(round(pa * (1 - w) + pb * w)) for pa, pb in zip(box_a, box)
+                ))
+            t["boxes"][idx] = box
+            t["last"] = idx
+            frame_boxes.append(box)
             used_t.add(ti)
             used_b.add(bi)
-        for bi, b in enumerate(boxes):
-            if bi not in used_b:
-                tracks.append({"boxes": {idx: b}, "last": idx})
+        for bi, box in enumerate(detections):
+            if bi in used_b:
+                continue
+            self.tracks.append({"boxes": {idx: box}, "last": idx})
+            frame_boxes.append(box)
+            for i in range(max(0, idx - self.extend), idx):  # 軌跡起點往前延伸
+                self.boxes[i].append(box)
 
-    n = n_frames if n_frames is not None else len(detections)
-    per_frame: dict[int, list] = {}
-    for t in tracks:
-        idxs = sorted(t["boxes"])
-        filled: dict[int, tuple] = {}
-        for a, b in zip(idxs, idxs[1:]):
-            filled[a] = t["boxes"][a]
-            for i in range(a + 1, b):  # 漏偵測的幀：線性內插
-                w = (i - a) / (b - a)
-                filled[i] = tuple(
-                    int(round(pa * (1 - w) + pb * w))
-                    for pa, pb in zip(t["boxes"][a], t["boxes"][b])
-                )
-        filled[idxs[-1]] = t["boxes"][idxs[-1]]
-        for i in range(max(0, idxs[0] - extend), idxs[0]):  # 軌跡起點往前延伸
-            filled[i] = t["boxes"][idxs[0]]
-        for i in range(idxs[-1] + 1, min(n, idxs[-1] + 1 + extend)):  # 終點往後延伸
-            filled[i] = t["boxes"][idxs[-1]]
-        for i, b in filled.items():
-            per_frame.setdefault(i, []).append(b)
-    return per_frame
+        out = self._emit(idx - self.delay)
+        # 已結束且終點延伸也輸出完的軌跡可以丟掉
+        self.tracks = [t for t in self.tracks if idx - t["last"] <= self.delay + self.extend]
+        return out
 
+    def flush(self) -> list[tuple[np.ndarray, list]]:
+        """影片結束：輸出所有還在緩衝的畫面。"""
+        return self._emit(self.idx - 1)
+
+    def _emit(self, upto: int) -> list[tuple[np.ndarray, list]]:
+        out = []
+        while self.pending and self.pending[0][0] <= upto:
+            e, frame = self.pending.popleft()
+            boxes = self.boxes.pop(e, [])
+            for t in self.tracks:  # 已結束軌跡的終點往後延伸
+                a = t["last"]
+                if a < e <= a + self.extend:
+                    boxes.append(t["boxes"][a])
+            out.append((frame, boxes))
+        return out
+
+
+# ---------------------------------------------------------------------------
+# 照片
+# ---------------------------------------------------------------------------
 
 def process_image(path: Path, out_path: Path, detector, args, log=print):
     img = cv2.imread(str(path))
@@ -339,173 +485,244 @@ def process_image(path: Path, out_path: Path, detector, args, log=print):
     return n
 
 
-def mux_audio(original: Path, video_only: Path, out_path: Path) -> bool:
-    """用 ffmpeg 把原始檔的音軌接回處理後的影片，並轉成 H.264。"""
-    ffmpeg = find_ffmpeg()
-    if ffmpeg is None:
-        return False
+# ---------------------------------------------------------------------------
+# 影片編碼
+# ---------------------------------------------------------------------------
+
+_SOFTWARE_ENCODER = ("libx264", ["-preset", "medium", "-crf", "20"])
+
+# 各平台硬體編碼器（依優先順序）與畫質參數，畫質設定約略對齊 libx264 crf 20
+_HW_ENCODERS = {
+    "darwin": [("h264_videotoolbox", ["-q:v", "65"])],
+    "win32": [
+        ("h264_nvenc", ["-preset", "p4", "-rc", "vbr", "-cq", "23", "-b:v", "0"]),
+        ("h264_qsv", ["-global_quality", "23"]),
+        ("h264_amf", ["-rc", "cqp", "-qp_i", "22", "-qp_p", "24"]),
+    ],
+    "linux": [
+        ("h264_nvenc", ["-preset", "p4", "-rc", "vbr", "-cq", "23", "-b:v", "0"]),
+        ("h264_qsv", ["-global_quality", "23"]),
+    ],
+}
+_encoder_cache: dict[str, tuple[str, list[str]]] = {}
+
+
+def _probe_encoder(ffmpeg: str, name: str, opts: list[str]) -> bool:
+    """實際試編一小段黑畫面：ffmpeg 有編進某個硬體編碼器，不代表這台機器有對應硬體。"""
     cmd = [
-        ffmpeg, "-y", "-loglevel", "error",
-        "-i", str(video_only), "-i", str(original),
-        "-map", "0:v:0", "-map", "1:a:0?",
-        "-c:v", "libx264", "-preset", "medium", "-crf", "20",
-        "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest",
-        str(out_path),
+        ffmpeg, "-hide_banner", "-loglevel", "error",
+        "-f", "lavfi", "-i", "color=black:s=256x256:r=30:d=0.2",
+        "-c:v", name, *opts, "-pix_fmt", "yuv420p", "-f", "null", "-",
     ]
-    kwargs = {}
-    if sys.platform == "win32":
-        # Windows 的 GUI 程式啟動 console 子程序會閃出主控台視窗，加旗標隱藏
-        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-    return subprocess.run(cmd, **kwargs).returncode == 0
+    try:
+        return subprocess.run(
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30, **_subprocess_kwargs()
+        ).returncode == 0
+    except Exception:
+        return False
 
 
-def process_video(path: Path, out_path: Path, detector, args, log=print, progress=None, cancel=None):
-    """progress(done, total) 回報進度；cancel() 回傳 True 時中止並清理。
+def pick_encoder(mode: str = "auto") -> tuple[str, list[str]]:
+    """選擇影片編碼器，回傳 (編碼器名稱, 額外參數)。
 
-    預設走兩段式（全片偵測 → 追蹤補洞 → 套用輸出）；args.track=False 時走
-    逐幀即時處理（sticky_boxes 補償）。
+    auto：有可用的硬體編碼器就用，否則 libx264；software：一律 libx264；
+    hardware：沒有可用的硬體編碼器就報錯。探測結果會快取，每個程序只試一次。
     """
-    if getattr(args, "track", True):
-        return _process_video_tracked(path, out_path, detector, args, log, progress, cancel)
-    return _process_video_stream(path, out_path, detector, args, log, progress, cancel)
+    if mode == "software":
+        return _SOFTWARE_ENCODER
+    if mode not in _encoder_cache:
+        ffmpeg = find_ffmpeg()
+        found = None
+        if ffmpeg:
+            for name, opts in _HW_ENCODERS.get(sys.platform, []):
+                if _probe_encoder(ffmpeg, name, opts):
+                    found = (name, opts)
+                    break
+        if found is None and mode == "hardware":
+            sys.exit("找不到可用的硬體編碼器（需要 ffmpeg 與支援的 GPU / 媒體引擎），可改用 --encoder auto")
+        _encoder_cache[mode] = found or _SOFTWARE_ENCODER
+    return _encoder_cache[mode]
 
 
-def _process_video_tracked(path, out_path, detector, args, log, progress, cancel):
+class _FfmpegWriter:
+    """把 BGR 畫面經 stdin 送給 ffmpeg，一次完成編碼與原始音軌合併（不經中間檔、不重複壓縮）。"""
+
+    def __init__(self, ffmpeg: str, out_path: Path, original: Path, fps: float,
+                 size: tuple[int, int], encoder: tuple[str, list[str]]):
+        w, h = size
+        self.encoder, opts = encoder
+        self._err = tempfile.TemporaryFile()
+        cmd = [
+            ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+            "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{w}x{h}", "-framerate", f"{fps:.6f}",
+            "-i", "pipe:0",
+            "-i", str(original),
+            "-map", "0:v:0", "-map", "1:a:0?",
+            "-c:v", self.encoder, *opts,
+            "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",  # H.264 yuv420p 需要偶數邊長
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-shortest", "-movflags", "+faststart",
+            str(out_path),
+        ]
+        self.proc = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=self._err, **_subprocess_kwargs()
+        )
+
+    def write(self, frame: np.ndarray):
+        self.proc.stdin.write(frame.tobytes())  # ffmpeg 掛掉時會丟 BrokenPipeError
+
+    def close(self, abort: bool = False) -> str | None:
+        """結束編碼並回傳 ffmpeg 的錯誤訊息（成功為 None）。abort=True 時直接中止。"""
+        try:
+            self.proc.stdin.close()
+        except Exception:
+            pass
+        if abort:
+            self.proc.terminate()
+        rc = self.proc.wait()
+        self._err.seek(0)
+        msg = self._err.read().decode(errors="replace").strip()
+        self._err.close()
+        return None if rc == 0 else (msg or f"ffmpeg 結束碼 {rc}")
+
+
+class _Cv2Writer:
+    """沒有 ffmpeg 時的備援：OpenCV 直接輸出 mp4v，無音軌。"""
+
+    encoder = "mp4v（OpenCV，無音軌）"
+
+    def __init__(self, out_path: Path, fps: float, size: tuple[int, int]):
+        self.writer = cv2.VideoWriter(str(out_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, size)
+
+    def write(self, frame: np.ndarray):
+        self.writer.write(frame)
+
+    def close(self, abort: bool = False) -> str | None:
+        self.writer.release()
+        return None
+
+
+# ---------------------------------------------------------------------------
+# 影片處理
+# ---------------------------------------------------------------------------
+
+def _iter_censored_frames(cap, detector, args, cancel, stats: dict, report):
+    """讀取影片、偵測、（追蹤補洞）、打碼，依序 yield 打好碼的畫面。
+
+    追蹤模式經 StreamTracker 線上補洞，輸出比讀入延遲 delay 幀，影片只需解碼一遍；
+    非追蹤模式逐幀處理並用 sticky_boxes 補償。stats 累計 frames_read / faces / covered / cancelled。
+    """
+    tracker = StreamTracker() if getattr(args, "track", True) else None
+    sticky: list = []
+    while True:
+        if cancel is not None and cancel():
+            stats["cancelled"] = True
+            return
+        ok, frame = cap.read()
+        if not ok:
+            break
+        stats["frames_read"] += 1
+        report(stats["frames_read"])
+        if tracker is None:
+            stats["faces"] += process_frame(frame, detector, args, sticky)
+            yield frame
+            continue
+        boxes = detector.detect(frame)
+        stats["faces"] += len(boxes)
+        for out_frame, out_boxes in tracker.push(frame, boxes):
+            stats["covered"] += len(out_boxes)
+            apply_boxes(out_frame, out_boxes, args)
+            yield out_frame
+    if tracker is not None:
+        for out_frame, out_boxes in tracker.flush():
+            stats["covered"] += len(out_boxes)
+            apply_boxes(out_frame, out_boxes, args)
+            yield out_frame
+
+
+_RETRY = object()  # _process_video_once 的回傳哨兵：ffmpeg 編碼失敗，請改用 OpenCV 重跑
+
+
+def _process_video_once(path, out_path, detector, args, sink: str, ffmpeg, log, progress, cancel):
+    encoder = pick_encoder(getattr(args, "encoder", "auto")) if sink == "ffmpeg" else None
+
     cap = cv2.VideoCapture(str(path))
     if not cap.isOpened():
         log(f"⚠ 無法開啟影片：{path}")
         return None
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    stats = {"frames_read": 0, "faces": 0, "covered": 0, "cancelled": False}
 
-    # 第一遍：全片偵測（最耗時），只收集偵測框
-    detections: list[list] = []
+    def report(done: int):
+        if progress is not None:
+            progress(done, total)
+        elif done % 100 == 0:
+            pct = f"{done / total:.0%}" if total > 0 else f"{done} 幀"
+            print(f"  {path.name}: 處理中 {pct}", flush=True)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    writer = None
+    written = 0
+    error = None
     try:
-        while True:
-            if cancel is not None and cancel():
-                log(f"⚠ 已取消：{path.name}")
-                return None
-            ok, frame = cap.read()
-            if not ok:
-                break
-            detections.append(detector.detect(frame))
-            i = len(detections)
-            if progress is not None:
-                progress(i, max(total, i) * 2)
-            elif i % 100 == 0:
-                pct = f"{i / total:.0%}" if total > 0 else f"{i} 幀"
-                print(f"  {path.name}: 偵測中 {pct}", flush=True)
+        for frame in _iter_censored_frames(cap, detector, args, cancel, stats, report):
+            if writer is None:
+                # 直式手機影片帶旋轉 metadata 時 CAP_PROP 的寬高可能與實際幀不符，以第一幀實際尺寸為準
+                h, w = frame.shape[:2]
+                if sink == "ffmpeg":
+                    writer = _FfmpegWriter(ffmpeg, out_path, path, fps, (w, h), encoder)
+                else:
+                    writer = _Cv2Writer(out_path, fps, (w, h))
+            writer.write(frame)
+            written += 1
+    except (BrokenPipeError, OSError) as e:
+        error = str(e)
     finally:
         cap.release()
+        if writer is not None:
+            err = writer.close(abort=stats["cancelled"] or error is not None)
+            error = err or error
 
-    n = len(detections)
-    if n == 0:
+    if stats["cancelled"]:
+        out_path.unlink(missing_ok=True)
+        log(f"⚠ 已取消：{path.name}")
+        return None
+    if error is not None:
+        out_path.unlink(missing_ok=True)
+        if sink == "ffmpeg":
+            log(f"⚠ ffmpeg 編碼失敗：{error}")
+            return _RETRY
+        log(f"⚠ 無法輸出 {path.name}：{error}")
+        return None
+    if written == 0:
+        out_path.unlink(missing_ok=True)
         log(f"⚠ 無法解碼任何畫面：{path.name}")
         return None
 
-    per_frame = build_tracks(detections, n_frames=n)
-    total_faces = sum(len(b) for b in detections)
-    covered = sum(len(v) for v in per_frame.values())
-
-    # 第二遍：把追蹤補齊後的框套用到每一幀並輸出
-    cap = cv2.VideoCapture(str(path))
-    tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
-    tmp_path = Path(tmp.name)
-    tmp.close()
-    writer = None
-    idx = 0
-    cancelled = False
-    try:
-        while True:
-            if cancel is not None and cancel():
-                cancelled = True
-                break
-            ok, frame = cap.read()
-            if not ok:
-                break
-            if writer is None:
-                h, w = frame.shape[:2]
-                writer = cv2.VideoWriter(str(tmp_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
-            apply_boxes(frame, per_frame.get(idx, []), args)
-            writer.write(frame)
-            idx += 1
-            if progress is not None:
-                progress(n + idx, n * 2)
-    finally:
-        cap.release()
-        if writer is not None:
-            writer.release()
-
-    if cancelled or idx == 0:
-        tmp_path.unlink(missing_ok=True)
-        log(f"⚠ {'已取消' if cancelled else '無法輸出任何畫面'}：{path.name}")
-        return None
-
-    if mux_audio(path, tmp_path, out_path):
-        tmp_path.unlink(missing_ok=True)
+    if getattr(args, "track", True):
+        detail = f"偵測 {stats['faces']} 次，追蹤補齊後遮蔽 {stats['covered']} 次"
     else:
-        shutil.move(str(tmp_path), str(out_path))
-        log("  （未偵測到 ffmpeg 或合併失敗，輸出不含音軌）")
-    log(f"✓ {path.name} → {out_path.name}（共 {idx} 幀，偵測 {total_faces} 次，追蹤補齊後遮蔽 {covered} 次）")
-    return idx, total_faces
+        detail = f"累計偵測 {stats['faces']} 次人臉"
+    log(f"✓ {path.name} → {out_path.name}（共 {written} 幀，{detail}，編碼 {writer.encoder}）")
+    return written, stats["faces"]
 
 
-def _process_video_stream(path, out_path, detector, args, log, progress, cancel):
-    cap = cv2.VideoCapture(str(path))
-    if not cap.isOpened():
-        log(f"⚠ 無法開啟影片：{path}")
-        return None
+def process_video(path: Path, out_path: Path, detector, args, log=print, progress=None, cancel=None):
+    """處理單支影片。回傳 (幀數, 累計偵測次數)；失敗或取消回傳 None。
 
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-    tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
-    tmp_path = Path(tmp.name)
-    tmp.close()
-    # 直式手機影片帶旋轉 metadata 時，CAP_PROP 回報的寬高可能與實際幀不符，
-    # 因此以第一幀的實際尺寸初始化 writer
-    writer = None
-
-    sticky_boxes: list = []
-    frame_idx = 0
-    total_faces = 0
-    cancelled = False
-    try:
-        while True:
-            if cancel is not None and cancel():
-                cancelled = True
-                break
-            ok, frame = cap.read()
-            if not ok:
-                break
-            if writer is None:
-                h, w = frame.shape[:2]
-                writer = cv2.VideoWriter(str(tmp_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
-            total_faces += process_frame(frame, detector, args, sticky_boxes)
-            writer.write(frame)
-            frame_idx += 1
-            if progress is not None:
-                progress(frame_idx, total)
-            elif frame_idx % 100 == 0:
-                pct = f"{frame_idx / total:.0%}" if total > 0 else f"{frame_idx} 幀"
-                print(f"  {path.name}: 已處理 {pct}", flush=True)
-    finally:
-        cap.release()
-        if writer is not None:
-            writer.release()
-
-    if cancelled or frame_idx == 0:
-        tmp_path.unlink(missing_ok=True)
-        log(f"⚠ {'已取消' if cancelled else '無法解碼任何畫面'}：{path.name}")
-        return None
-
-    if mux_audio(path, tmp_path, out_path):
-        tmp_path.unlink(missing_ok=True)
-    else:
-        shutil.move(str(tmp_path), str(out_path))
-        log("  （未偵測到 ffmpeg 或合併失敗，輸出不含音軌）")
-    log(f"✓ {path.name} → {out_path.name}（共 {frame_idx} 幀，累計偵測 {total_faces} 次人臉）")
-    return frame_idx, total_faces
+    progress(done, total) 回報進度；cancel() 回傳 True 時中止並清理。
+    影片只解碼一遍：追蹤模式（預設）用 StreamTracker 線上補洞，args.track=False 則逐幀即時處理。
+    畫面直接經 stdin 送進 ffmpeg，一次完成編碼（依 args.encoder 可用硬體編碼器）與原始音軌合併，
+    不再經過中間檔重複壓縮；沒有 ffmpeg 時退回 OpenCV 輸出（無音軌），ffmpeg 編碼失敗也會用 OpenCV 重跑。
+    """
+    ffmpeg = find_ffmpeg()
+    for sink in (["ffmpeg", "cv2"] if ffmpeg else ["cv2"]):
+        result = _process_video_once(path, out_path, detector, args, sink, ffmpeg, log, progress, cancel)
+        if result is not _RETRY:
+            return result
+        log("  （改用 OpenCV 重新輸出，將不含音軌）")
+    return None
 
 
 def default_output(path: Path, out_dir: Path | None) -> Path:
@@ -513,6 +730,10 @@ def default_output(path: Path, out_dir: Path | None) -> Path:
     name = f"{path.stem}_blurred{suffix}"
     return (out_dir / name) if out_dir else path.with_name(name)
 
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(
@@ -539,7 +760,13 @@ def main():
     parser.add_argument("--head", action="store_true",
                         help="加上頭部偵測（含背對鏡頭、極端角度），遮蔽範圍從臉擴大到整顆頭")
     parser.add_argument("--no-track", dest="track", action="store_false",
-                        help="停用影片兩段式追蹤補洞，改回逐幀即時處理（較省記憶體）")
+                        help="停用影片追蹤補洞，改回逐幀即時處理")
+    parser.add_argument("--device", choices=DEVICE_CHOICES, default="auto",
+                        help="偵測運算裝置：auto 有 GPU 就用（macOS CoreML / Windows DirectML）、"
+                             "不行自動退回 CPU；gpu 強制用 GPU（不可用時報錯）")
+    parser.add_argument("--encoder", choices=ENCODER_CHOICES, default="auto",
+                        help="影片編碼器：auto 有硬體編碼器（VideoToolbox / NVENC / QSV / AMF）就用，"
+                             "否則 libx264；software 一律 libx264；hardware 強制硬體（不可用時報錯）")
     args = parser.parse_args()
 
     in_path = Path(args.input).expanduser()
@@ -547,6 +774,7 @@ def main():
         sys.exit(f"找不到輸入：{in_path}")
 
     detector = create_detector(args)
+    print(f"偵測裝置：{device_label(detector)}")
 
     if in_path.is_dir():
         out_dir = Path(args.output).expanduser() if args.output else in_path / "blurred"
