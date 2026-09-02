@@ -457,7 +457,9 @@ class MainWindow(QMainWindow):
             self.append_log(runtime_info())
             self.logged_env = True
         self.append_log(
-            f"開始處理 {len(self.files)} 個檔案 · 偵測器 {args.detector} · 解析度 {args.det_size} · "
+            f"開始處理 {len(self.files)} 個檔案 · "
+            f"{'馬賽克' if args.mode == 'mosaic' else '高斯模糊'} 強度 {args.strength}"
+            f"{'（橢圓遮罩）' if args.ellipse else ''} · 偵測器 {args.detector} · 解析度 {args.det_size} · "
             f"門檻 {args.conf:.2f} · 頭部 {('開 ' + format(args.head_conf, '.2f')) if args.head else '關'} · "
             f"追蹤 {'開' if args.track else '關'} · 補救 {'開' if args.rescue else '關'} · "
             f"裝置 {args.device} · 編碼 {args.encoder} · 輸出 {self.out_dir or '原檔旁'}"

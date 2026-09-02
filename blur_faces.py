@@ -532,8 +532,20 @@ def censor_region(frame, x1, y1, x2, y2, mode: str, strength: int, ellipse: bool
         small = cv2.resize(roi, (blocks, blocks), interpolation=cv2.INTER_LINEAR)
         censored = cv2.resize(small, (roi.shape[1], roi.shape[0]), interpolation=cv2.INTER_NEAREST)
     else:  # blur
-        k = max(5, (max(roi.shape[:2]) // (12 - strength)) | 1)  # 奇數 kernel
-        censored = cv2.GaussianBlur(roi, (k, k), 0)
+        # kernel 跟著 ROI 尺寸走才有足夠遮蔽力，但大 ROI 直接模糊極慢（4K 滿版臉 k≈550，
+        # 單框要 1.2s）；先把長邊縮到 256 再用等比例 kernel 模糊、放大回去，
+        # 相對模糊程度相同（k/邊長 不變）、視覺上一樣無法辨識，只要約 3ms。
+        src = roi
+        scale = 256 / max(roi.shape[:2])
+        if scale < 1.0:
+            src = cv2.resize(
+                roi, (max(1, int(roi.shape[1] * scale)), max(1, int(roi.shape[0] * scale))),
+                interpolation=cv2.INTER_AREA,
+            )
+        k = max(5, (max(src.shape[:2]) // (12 - strength)) | 1)  # 奇數 kernel
+        censored = cv2.GaussianBlur(src, (k, k), 0)
+        if src is not roi:
+            censored = cv2.resize(censored, (roi.shape[1], roi.shape[0]), interpolation=cv2.INTER_LINEAR)
 
     if ellipse:
         mask = np.zeros(roi.shape[:2], dtype=np.uint8)
@@ -854,6 +866,15 @@ class _Heartbeat:
         self._thread.join(timeout=3)
         return False
 
+    def _stage_shares(self, elapsed: float) -> str:
+        """累計各階段耗時佔比（取前三名、≥5% 才列），處理中就能看出瓶頸在哪個階段。"""
+        pairs = [("解碼", "t_decode"), ("偵測", "t_detect"), ("追蹤", "t_track"),
+                 ("打碼", "t_censor"), ("轉bytes", "t_tobytes"), ("送編碼", "t_pipe")]
+        seg = sorted(((zh, self.stats.get(k, 0.0) / elapsed) for zh, k in pairs),
+                     key=lambda p: p[1], reverse=True)
+        top = [f"{zh} {v:.0%}" for zh, v in seg[:3] if v >= 0.05]
+        return f"，累計 {'、'.join(top)}" if top else ""
+
     def _run(self):
         t_start = time.time()
         last_report = t_start
@@ -864,27 +885,34 @@ class _Heartbeat:
             frames = self.stats["frames_read"]
             phase = PHASES.get(self.stats.get("phase"), self.stats.get("phase", "?"))
             since_advance = now - self.stats.get("t_advance", t_start)
-            if since_advance >= self.stall_after:
-                self.log(f"⚠ 已 {since_advance:.0f} 秒沒有新畫面產出，可能卡在【{phase}】"
-                         f"（已處理 {frames}" + (f"/{self.total}" if self.total > 0 else "") + " 幀）")
-                last_report = now
-                stalled = True
-            elif now - last_report >= self.interval:
+            if since_advance < self.stall_after:
+                stalled = False
+                if now - last_report < self.interval:
+                    continue
                 el = now - t_start
+                # last_frames / last_report 只在每次回報時一起更新，兩者的時間窗才會一致
                 inst = (frames - last_frames) / (now - last_report)
                 avg = frames / el if el else 0
                 pct = f"{frames / self.total:.0%}" if self.total > 0 else f"{frames} 幀"
                 eta = f"，剩約 {(self.total - frames) / inst:.0f}s" if self.total > 0 and inst > 0.1 else ""
                 rss = process_rss_mb()
                 extra = f"，本幀 {self.stats.get('last_boxes', 0)} 框"
+                if self.stats.get("last_max_side"):
+                    extra += f"（最大 {self.stats['last_max_side']}px）"
+                extra += self._stage_shares(el)
                 if rss:
                     extra += f"，記憶體 {rss:.0f}MB"
                 self.log(f"⏳ 進度 {pct}（{frames} 幀，即時 {inst:.1f} fps、平均 {avg:.1f} fps，"
                          f"目前【{phase}】{extra}{eta}）")
-                last_report = now
-                stalled = False
-            if not stalled:
-                last_frames = frames
+            elif not stalled or now - last_report >= self.interval:
+                # 一進入卡住狀態立刻警告，之後每 interval 秒重複一次（原本每 3 秒洗版）
+                self.log(f"⚠ 已 {since_advance:.0f} 秒沒有新畫面產出，可能卡在【{phase}】"
+                         f"（已處理 {frames}" + (f"/{self.total}" if self.total > 0 else "") + " 幀）")
+                stalled = True
+            else:
+                continue
+            last_report = now
+            last_frames = frames
 
 
 def _iter_censored_frames(cap, detector, args, cancel, stats: dict, report):
@@ -927,6 +955,7 @@ def _iter_censored_frames(cap, detector, args, cancel, stats: dict, report):
         for out_frame, out_boxes in emitted:
             stats["covered"] += len(out_boxes)
             stats["last_boxes"] = len(out_boxes)
+            stats["last_max_side"] = max((max(b[2], b[3]) for b in out_boxes), default=0)
             stats["max_boxes"] = max(stats["max_boxes"], len(out_boxes))
             stats["phase"] = "censor"
             t0 = time.time()
@@ -954,10 +983,14 @@ def _process_video_once(path, out_path, detector, args, sink: str, ffmpeg, log, 
         return None
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    # 先印影片基本資訊，變慢時一眼看出是不是解析度太高（直式影片帶旋轉 metadata 時寬高可能對調）
+    w0, h0 = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    dur = f"（約 {total / fps:.0f}s）" if total > 0 and fps > 0 else ""
+    log(f"▶ {path.name}：{w0}x{h0}，{fps:.0f} fps，共 {total} 幀{dur}")
     stats = {"frames_read": 0, "faces": 0, "covered": 0, "cancelled": False,
              "t_decode": 0.0, "t_detect": 0.0, "t_track": 0.0, "t_censor": 0.0,
              "t_tobytes": 0.0, "t_pipe": 0.0, "phase": "decode", "t_advance": time.time(),
-             "last_boxes": 0, "max_boxes": 0}
+             "last_boxes": 0, "max_boxes": 0, "last_max_side": 0}
     rescue_before = rescue_stats(detector)
     t_start = time.time()
 
@@ -1005,10 +1038,20 @@ def _process_video_once(path, out_path, detector, args, sink: str, ffmpeg, log, 
             t_finalize = time.time() - _t
             error = err or error
     stats["phase"] = "done"
+    elapsed = max(time.time() - t_start, 1e-9)
+    stats["t_write"] = stats["t_tobytes"] + stats["t_pipe"]
+    # 逐階段佔比，涵蓋 100%：解碼 / 偵測 / 追蹤補洞 / 打碼 / 轉bytes / 送編碼 / 收尾ffmpeg，剩下算「其他」
+    timed = [("解碼", "t_decode"), ("偵測", "t_detect"), ("追蹤", "t_track"), ("打碼", "t_censor"),
+             ("轉bytes", "t_tobytes"), ("送編碼", "t_pipe")]
+    accounted = sum(stats[v] for _, v in timed) + t_finalize
+    other = max(0.0, elapsed - accounted)
+    seg = [(zh, stats[v]) for zh, v in timed] + [("收尾", t_finalize), ("其他", other)]
+    parts = ", ".join(f"{zh} {t / elapsed:.0%}" for zh, t in seg if t / elapsed >= 0.005)
 
     if stats["cancelled"]:
         out_path.unlink(missing_ok=True)
-        log(f"⚠ 已取消：{path.name}")
+        log(f"⚠ 已取消：{path.name}（已解碼 {stats['frames_read']} 幀、輸出 {written} 幀，"
+            f"{elapsed:.1f}s；{parts}）")
         return None
     if error is not None:
         out_path.unlink(missing_ok=True)
@@ -1026,15 +1069,6 @@ def _process_video_once(path, out_path, detector, args, sink: str, ffmpeg, log, 
         detail = f"偵測 {stats['faces']} 次，追蹤補齊後遮蔽 {stats['covered']} 次"
     else:
         detail = f"累計偵測 {stats['faces']} 次人臉"
-    elapsed = time.time() - t_start
-    stats["t_write"] = stats["t_tobytes"] + stats["t_pipe"]
-    # 逐階段佔比，涵蓋 100%：解碼 / 偵測 / 追蹤補洞 / 打碼 / 轉bytes / 送編碼 / 收尾ffmpeg，剩下算「其他」
-    timed = [("解碼", "t_decode"), ("偵測", "t_detect"), ("追蹤", "t_track"), ("打碼", "t_censor"),
-             ("轉bytes", "t_tobytes"), ("送編碼", "t_pipe")]
-    accounted = sum(stats[v] for _, v in timed) + t_finalize
-    other = max(0.0, elapsed - accounted)
-    seg = [(zh, stats[v]) for zh, v in timed] + [("收尾", t_finalize), ("其他", other)]
-    parts = ", ".join(f"{zh} {t / elapsed:.0%}" for zh, t in seg if t / elapsed >= 0.005)
     rescue_after = rescue_stats(detector)
     if rescue_before and rescue_after and rescue_after[0] > rescue_before[0]:
         trig, rf, rb = (a - b for a, b in zip(rescue_after, rescue_before))
