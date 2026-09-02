@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections import deque
 from pathlib import Path
@@ -741,7 +742,10 @@ class _FfmpegWriter:
         )
 
     def write(self, frame: np.ndarray):
-        self.proc.stdin.write(frame.tobytes())  # ffmpeg 掛掉時會丟 BrokenPipeError
+        self.write_raw(frame.tobytes())
+
+    def write_raw(self, raw: bytes):
+        self.proc.stdin.write(raw)  # ffmpeg 掛掉時會丟 BrokenPipeError
 
     def close(self, abort: bool = False) -> str | None:
         """結束編碼並回傳 ffmpeg 的錯誤訊息（成功為 None）。abort=True 時直接中止。"""
@@ -778,6 +782,68 @@ class _Cv2Writer:
 # 影片處理
 # ---------------------------------------------------------------------------
 
+# 各處理階段的中文標籤（供心跳回報「目前卡在哪一步」）
+PHASES = {
+    "decode": "解碼", "detect": "偵測", "track": "追蹤補洞",
+    "censor": "打碼", "write": "編碼寫入", "finalize": "收尾（等 ffmpeg 完成編碼）", "done": "完成",
+}
+
+
+class _Heartbeat:
+    """背景執行緒：定期回報處理進度，並在畫面長時間沒有推進時指出卡在哪個階段。
+
+    stats 由主迴圈更新：frames_read（已解碼幀數）、phase（目前階段 key）、t_advance（最後一次
+    有新幀的時刻）。主迴圈若卡在某次 cap.read() 或 session.run()（例如壞幀、DirectML 卡住），
+    幀數會停止推進，這個執行緒仍會每隔幾秒印出「已 Xs 沒有新畫面，卡在【偵測】」。
+    """
+
+    def __init__(self, log, stats: dict, total: int, interval: float = 15.0, stall_after: float = 20.0):
+        self.log = log
+        self.stats = stats
+        self.total = total
+        self.interval = interval
+        self.stall_after = stall_after
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def __enter__(self):
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        self._thread.join(timeout=3)
+        return False
+
+    def _run(self):
+        t_start = time.time()
+        last_report = t_start
+        last_frames = 0
+        stalled = False
+        while not self._stop.wait(3.0):
+            now = time.time()
+            frames = self.stats["frames_read"]
+            phase = PHASES.get(self.stats.get("phase"), self.stats.get("phase", "?"))
+            since_advance = now - self.stats.get("t_advance", t_start)
+            if since_advance >= self.stall_after:
+                self.log(f"⚠ 已 {since_advance:.0f} 秒沒有新畫面產出，可能卡在【{phase}】"
+                         f"（已處理 {frames}" + (f"/{self.total}" if self.total > 0 else "") + " 幀）")
+                last_report = now
+                stalled = True
+            elif now - last_report >= self.interval:
+                el = now - t_start
+                inst = (frames - last_frames) / (now - last_report)
+                avg = frames / el if el else 0
+                pct = f"{frames / self.total:.0%}" if self.total > 0 else f"{frames} 幀"
+                eta = f"，剩約 {(self.total - frames) / inst:.0f}s" if self.total > 0 and inst > 0.1 else ""
+                self.log(f"⏳ 進度 {pct}（{frames} 幀，即時 {inst:.1f} fps、平均 {avg:.1f} fps，"
+                         f"目前【{phase}】{eta}）")
+                last_report = now
+                stalled = False
+            if not stalled:
+                last_frames = frames
+
+
 def _iter_censored_frames(cap, detector, args, cancel, stats: dict, report):
     """讀取影片、偵測、（追蹤補洞）、打碼，依序 yield 打好碼的畫面。
 
@@ -790,31 +856,44 @@ def _iter_censored_frames(cap, detector, args, cancel, stats: dict, report):
         if cancel is not None and cancel():
             stats["cancelled"] = True
             return
+        stats["phase"] = "decode"
         t0 = time.time()
         ok, frame = cap.read()
         stats["t_decode"] += time.time() - t0
         if not ok:
             break
         stats["frames_read"] += 1
+        stats["t_advance"] = time.time()
         report(stats["frames_read"])
         if tracker is None:
+            stats["phase"] = "detect"
             t0 = time.time()
             stats["faces"] += process_frame(frame, detector, args, sticky)
             stats["t_detect"] += time.time() - t0
             yield frame
             continue
+        stats["phase"] = "detect"
         t0 = time.time()
         boxes = detector.detect(frame)
         stats["t_detect"] += time.time() - t0
         stats["faces"] += len(boxes)
-        for out_frame, out_boxes in tracker.push(frame, boxes):
+        stats["phase"] = "track"
+        t0 = time.time()
+        emitted = tracker.push(frame, boxes)
+        stats["t_track"] += time.time() - t0
+        for out_frame, out_boxes in emitted:
             stats["covered"] += len(out_boxes)
+            stats["phase"] = "censor"
+            t0 = time.time()
             apply_boxes(out_frame, out_boxes, args)
+            stats["t_censor"] += time.time() - t0
             yield out_frame
     if tracker is not None:
         for out_frame, out_boxes in tracker.flush():
             stats["covered"] += len(out_boxes)
+            t0 = time.time()
             apply_boxes(out_frame, out_boxes, args)
+            stats["t_censor"] += time.time() - t0
             yield out_frame
 
 
@@ -831,41 +910,55 @@ def _process_video_once(path, out_path, detector, args, sink: str, ffmpeg, log, 
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     stats = {"frames_read": 0, "faces": 0, "covered": 0, "cancelled": False,
-             "t_decode": 0.0, "t_detect": 0.0, "t_write": 0.0}
+             "t_decode": 0.0, "t_detect": 0.0, "t_track": 0.0, "t_censor": 0.0,
+             "t_tobytes": 0.0, "t_pipe": 0.0, "phase": "decode", "t_advance": time.time()}
     rescue_before = rescue_stats(detector)
     t_start = time.time()
 
     def report(done: int):
-        if progress is not None:
+        if progress is not None:  # GUI 進度條；CLI 進度改由 _Heartbeat 統一回報
             progress(done, total)
-        elif done % 100 == 0:
-            pct = f"{done / total:.0%}" if total > 0 else f"{done} 幀"
-            print(f"  {path.name}: 處理中 {pct}", flush=True)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     writer = None
     written = 0
     error = None
+    t_finalize = 0.0
     try:
-        for frame in _iter_censored_frames(cap, detector, args, cancel, stats, report):
-            if writer is None:
-                # 直式手機影片帶旋轉 metadata 時 CAP_PROP 的寬高可能與實際幀不符，以第一幀實際尺寸為準
-                h, w = frame.shape[:2]
+        with _Heartbeat(log, stats, total):
+            for frame in _iter_censored_frames(cap, detector, args, cancel, stats, report):
+                if writer is None:
+                    # 直式手機影片帶旋轉 metadata 時 CAP_PROP 的寬高可能與實際幀不符，以第一幀實際尺寸為準
+                    h, w = frame.shape[:2]
+                    if sink == "ffmpeg":
+                        writer = _FfmpegWriter(ffmpeg, out_path, path, fps, (w, h), encoder)
+                    else:
+                        writer = _Cv2Writer(out_path, fps, (w, h))
+                stats["phase"] = "write"
                 if sink == "ffmpeg":
-                    writer = _FfmpegWriter(ffmpeg, out_path, path, fps, (w, h), encoder)
+                    t0 = time.time()
+                    raw = frame.tobytes()          # BGR → bytes：純 CPU / 記憶體頻寬
+                    stats["t_tobytes"] += time.time() - t0
+                    t0 = time.time()
+                    writer.write_raw(raw)          # 送進 ffmpeg：卡在這裡代表編碼器跟不上（背壓）
+                    stats["t_pipe"] += time.time() - t0
                 else:
-                    writer = _Cv2Writer(out_path, fps, (w, h))
+                    t0 = time.time()
+                    writer.write(frame)
+                    stats["t_pipe"] += time.time() - t0
+                written += 1
+            stats["phase"] = "finalize"
             t0 = time.time()
-            writer.write(frame)
-            stats["t_write"] += time.time() - t0
-            written += 1
     except (BrokenPipeError, OSError) as e:
         error = str(e)
     finally:
         cap.release()
         if writer is not None:
+            _t = time.time()
             err = writer.close(abort=stats["cancelled"] or error is not None)
+            t_finalize = time.time() - _t
             error = err or error
+    stats["phase"] = "done"
 
     if stats["cancelled"]:
         out_path.unlink(missing_ok=True)
@@ -888,9 +981,14 @@ def _process_video_once(path, out_path, detector, args, sink: str, ffmpeg, log, 
     else:
         detail = f"累計偵測 {stats['faces']} 次人臉"
     elapsed = time.time() - t_start
-    # 各階段佔比：解碼 / 偵測 / 編碼寫入（寫入含 ffmpeg 背壓，等於編碼時間），其餘是打碼與追蹤
-    parts = ", ".join(f"{k} {stats[v] / elapsed:.0%}" for k, v in
-                      (("解碼", "t_decode"), ("偵測", "t_detect"), ("編碼", "t_write")))
+    stats["t_write"] = stats["t_tobytes"] + stats["t_pipe"]
+    # 逐階段佔比，涵蓋 100%：解碼 / 偵測 / 追蹤補洞 / 打碼 / 轉bytes / 送編碼 / 收尾ffmpeg，剩下算「其他」
+    timed = [("解碼", "t_decode"), ("偵測", "t_detect"), ("追蹤", "t_track"), ("打碼", "t_censor"),
+             ("轉bytes", "t_tobytes"), ("送編碼", "t_pipe")]
+    accounted = sum(stats[v] for _, v in timed) + t_finalize
+    other = max(0.0, elapsed - accounted)
+    seg = [(zh, stats[v]) for zh, v in timed] + [("收尾", t_finalize), ("其他", other)]
+    parts = ", ".join(f"{zh} {t / elapsed:.0%}" for zh, t in seg if t / elapsed >= 0.005)
     rescue_after = rescue_stats(detector)
     if rescue_before and rescue_after and rescue_after[0] > rescue_before[0]:
         trig, rf, rb = (a - b for a, b in zip(rescue_after, rescue_before))
