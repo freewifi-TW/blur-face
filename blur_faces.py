@@ -391,18 +391,21 @@ class UnionDetector:
 
 
 class RescueDetector:
-    """旋轉補救：主偵測器整幀沒抓到臉時，把畫面轉 90 / 270 度再用同一套偵測器重跑。
+    """旋轉補救：主偵測器整幀沒抓到臉時，把畫面轉 90 / 270 度再用臉部模型重跑。
 
     專救橫躺、大角度歪斜的臉——SCRFD 對平面內旋轉約 ±30 度內穩定，躺姿、畫面橫著拍就會漏。
-    直接重用主偵測器覆核（而非舊版低門檻 YuNet 提名），誤框率與一般偵測相同，不會把頭髮、
-    衣服框成臉；代價是「臉比畫面還大」的極端特寫不再由補救涵蓋（多尺度偵測已補大部分）。
+    旋轉重跑只用臉部模型（rescue_parts，預設同主偵測器）：頭部模型對旋轉畫面上的圓弧皮膚、
+    關節、物體易給出 0.3-0.6 的誤判（實測誤打碼全部來自它），且頭部偵測本就較耐旋轉，
+    正著沒抓到的頭轉了也救不回多少，排除它可把補救誤框壓到 SCRFD 本身的水準。
     命中過的旋轉方向會排到最前、一中就停：連續橫躺片段每幀只多一次偵測，而非固定兩次。
     """
 
     ROTATIONS = {90: cv2.ROTATE_90_CLOCKWISE, 270: cv2.ROTATE_90_COUNTERCLOCKWISE}
 
-    def __init__(self, primary):
+    def __init__(self, primary, rescue_parts: list | None = None):
         self.primary = primary
+        parts = rescue_parts or [primary]
+        self.rescue_det = parts[0] if len(parts) == 1 else UnionDetector(parts)
         self.order = list(self.ROTATIONS)  # 嘗試順序，最近命中的排前面
         self.triggered = 0        # 主偵測沒抓到、啟用補救的幀數
         self.rescued_frames = 0   # 補救有抓到的幀數
@@ -427,7 +430,7 @@ class RescueDetector:
         self.triggered += 1
         h0, w0 = frame.shape[:2]
         for rot in list(self.order):
-            found = self.primary.detect(cv2.rotate(frame, self.ROTATIONS[rot]))
+            found = self.rescue_det.detect(cv2.rotate(frame, self.ROTATIONS[rot]))
             if found:
                 self.order.remove(rot)
                 self.order.insert(0, rot)
@@ -453,8 +456,9 @@ def create_detector(args, log=None):
       640 那道把它補回來（實測 9 張側臉照從 5 張提升到 8 張），GPU 每幀只多約 14 ms。args.multiscale=False 停用。
     - args.head_conf（預設 0.5）：頭部模型的門檻，與人臉門檻獨立。圓弧物體（椅端、門把、燈罩）多在
       0.5 到 0.6 之間被誤判成頭，室內誤框多時可調到 0.6；真人的頭在中等尺寸下多為 0.65 以上。
-    - args.rescue（預設關）：整幀沒抓到臉時，把畫面轉 90/270 度用同一套偵測器再跑一次（旋轉補救）。
-      救回橫躺、大角度歪斜的臉；因為是主偵測器覆核，誤框率與一般偵測相同。
+    - args.rescue（預設關）：整幀沒抓到臉時，把畫面轉 90/270 度用「臉部模型」再跑一次（旋轉補救），
+      不含頭部模型——頭部模型對旋轉畫面的圓弧皮膚/物體易誤判，且頭部偵測本就耐旋轉。
+      救回橫躺、大角度歪斜的臉，誤框率為 SCRFD 本身的水準。
     """
     device = getattr(args, "device", "auto")
     parts = []
@@ -466,11 +470,12 @@ def create_detector(args, log=None):
         parts.append(YunetDetector(args.conf))
         if log and device != "cpu" and args.detector == "yunet":
             log("YuNet 走 OpenCV DNN，只能用 CPU")
+    face_parts = list(parts)  # 旋轉補救只重跑臉部模型（不含頭部），共用同一批 session
     if getattr(args, "head", False):
         parts.append(HeadDetector(getattr(args, "head_conf", 0.5), device, log))
     det = parts[0] if len(parts) == 1 else UnionDetector(parts)
     if getattr(args, "rescue", False):
-        det = RescueDetector(det)
+        det = RescueDetector(det, face_parts)
     return det
 
 
@@ -1210,8 +1215,8 @@ def main():
     parser.add_argument("--no-multiscale", dest="multiscale", action="store_false",
                         help="停用多尺度：預設 det-size 高於 640 時會再加一道 640 掃描取聯集，補特寫大臉")
     parser.add_argument("--rescue", action="store_true",
-                        help="啟用旋轉補救：整幀沒抓到臉時，把畫面轉 90/270 度用同一套偵測器再跑一次，"
-                             "救回橫躺、大角度歪斜的臉；誤框率與一般偵測相同，預設關")
+                        help="啟用旋轉補救：整幀沒抓到臉時，把畫面轉 90/270 度用臉部模型（不含頭部）再跑一次，"
+                             "救回橫躺、大角度歪斜的臉；誤框率為 SCRFD 本身的水準，預設關")
     parser.add_argument("--device", choices=DEVICE_CHOICES, default="auto",
                         help="偵測運算裝置：auto 有 GPU 就用（macOS CoreML / Windows DirectML）、"
                              "不行自動退回 CPU；gpu 強制用 GPU（不可用時報錯）")
