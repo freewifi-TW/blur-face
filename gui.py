@@ -302,12 +302,12 @@ class MainWindow(QMainWindow):
         )
         grid.addWidget(self.track, 3, 3)
 
-        self.rescue = QCheckBox("特寫／旋轉補救")
+        self.rescue = QCheckBox("旋轉補救（橫躺／歪斜的臉）")
         self.rescue.setChecked(False)
         self.rescue.setToolTip(
-            "整幅畫面都沒抓到臉時，改用另一個模型對轉正、縮小後的畫面再試一次\n"
-            "專門救「手機貼在臉上自拍、畫面橫躺 90 度、臉被裁掉一半」的極端特寫\n"
-            "一般拍別人的影片不建議開：人物背對或低頭的瞬間，它可能把頭髮、衣服框成臉"
+            "整幅畫面都沒抓到臉時，把畫面轉 90 / 270 度再用同一套偵測器跑一次\n"
+            "救回橫躺、大角度歪斜的臉（躺姿影片、手機橫著貼近拍）\n"
+            "由主偵測器覆核，誤框率與一般偵測相同；只在整幀沒抓到時觸發，多花一次偵測時間"
         )
         grid.addWidget(self.rescue, 4, 3)
 

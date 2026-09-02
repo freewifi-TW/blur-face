@@ -390,30 +390,23 @@ class UnionDetector:
         return [boxes[i] for i in np.array(idxs).flatten()]
 
 
-class CloseupRescue:
-    """特寫／旋轉補救偵測器，只在主偵測器整幀沒抓到臉時啟用。
+class RescueDetector:
+    """旋轉補救：主偵測器整幀沒抓到臉時，把畫面轉 90 / 270 度再用同一套偵測器重跑。
 
-    針對「臉比畫面還大、畫面橫躺 90 度、臉被裁掉一部分、動態模糊」的極端特寫（手機貼很近的自拍、
-    躺姿影片常見）：SCRFD 與頭部模型在這類畫面上分數趨近 0，轉正縮小也拉不到 0.5；但 YuNet 在
-    「轉正 + 把畫面縮小一半」後仍能給 0.5 到 0.7。做法：把畫面放進兩倍大的畫布中央（臉在偵測器
-    眼中變小），對 0 / 90 / 270 度各跑一次 YuNet，框映射回原圖座標後 NMS 聯集。
-    門檻 0.4、只用縮小一半的畫布、不含 180 度，是實測中命中率最高且在無人照片上零誤報的組合
-    （多加縮放層級只會增加誤報與時間；門檻 0.5 在 h264 壓縮後的影片幀上會漏掉邊界案例）。
+    專救橫躺、大角度歪斜的臉——SCRFD 對平面內旋轉約 ±30 度內穩定，躺姿、畫面橫著拍就會漏。
+    直接重用主偵測器覆核（而非舊版低門檻 YuNet 提名），誤框率與一般偵測相同，不會把頭髮、
+    衣服框成臉；代價是「臉比畫面還大」的極端特寫不再由補救涵蓋（多尺度偵測已補大部分）。
+    命中過的旋轉方向會排到最前、一中就停：連續橫躺片段每幀只多一次偵測，而非固定兩次。
     """
 
-    ROTATIONS = {0: None, 90: cv2.ROTATE_90_CLOCKWISE, 270: cv2.ROTATE_90_COUNTERCLOCKWISE}
-    CONF = 0.4
-    SCALES = (2.0,)  # 畫布放大倍數（臉相對變小）；可設多個取聯集
-    MAX_SIDE = 1280  # 放大後的畫布長邊上限，控制 YuNet 成本
+    ROTATIONS = {90: cv2.ROTATE_90_CLOCKWISE, 270: cv2.ROTATE_90_COUNTERCLOCKWISE}
 
-    def __init__(self, conf: float | None = None, scales: tuple[float, ...] | None = None):
-        if not YUNET_MODEL.exists():
-            sys.exit(f"找不到模型檔 {YUNET_MODEL}，請先下載（見 README.md）")
-        self.conf = self.CONF if conf is None else conf
-        self.scales = self.SCALES if scales is None else scales
-        self.detector = cv2.FaceDetectorYN.create(
-            str(YUNET_MODEL), "", (320, 320), score_threshold=self.conf, nms_threshold=0.3, top_k=5000
-        )
+    def __init__(self, primary):
+        self.primary = primary
+        self.order = list(self.ROTATIONS)  # 嘗試順序，最近命中的排前面
+        self.triggered = 0        # 主偵測沒抓到、啟用補救的幀數
+        self.rescued_frames = 0   # 補救有抓到的幀數
+        self.rescued_boxes = 0    # 補救抓到的框數
 
     @staticmethod
     def _unrotate(box, rot: int, h0: int, w0: int) -> tuple[int, int, int, int]:
@@ -428,63 +421,20 @@ class CloseupRescue:
         return int(min(xs)), int(min(ys)), int(max(xs) - min(xs)), int(max(ys) - min(ys))
 
     def detect(self, frame: np.ndarray) -> list[tuple[int, int, int, int]]:
-        h0, w0 = frame.shape[:2]
-        boxes, scores = [], []
-        for rot, code in self.ROTATIONS.items():
-            imr = frame if code is None else cv2.rotate(frame, code)
-            h, w = imr.shape[:2]
-            for scale in self.scales:
-                # 幾何上等價於「把原圖貼進 scale 倍大的畫布中央、再把畫布縮到 MAX_SIDE 內」，
-                # 但改為先縮小影像再貼小畫布：4K 來源省下每個旋轉 33MP（約 100MB）的
-                # 畫布配置與一次 8K 級縮圖，補救成本從每幀數百 ms 降到數十 ms
-                side = min(self.MAX_SIDE, int(max(h, w) * scale))
-                s = side / scale / max(h, w)  # 原圖 → 畫布內影像的縮放比例
-                nw, nh = max(1, round(w * s)), max(1, round(h * s))
-                W, H = round(nw * scale), round(nh * scale)
-                oy, ox = (H - nh) // 2, (W - nw) // 2
-                canvas = np.full((H, W, 3), 114, dtype=np.uint8)
-                canvas[oy:oy + nh, ox:ox + nw] = (
-                    cv2.resize(imr, (nw, nh), interpolation=cv2.INTER_AREA) if (nw, nh) != (w, h) else imr
-                )
-                self.detector.setInputSize((W, H))
-                _, faces = self.detector.detect(canvas)
-                if faces is None:
-                    continue
-                for f in faces:
-                    x, y, bw, bh = f[:4]
-                    x1, y1 = max(0.0, (x - ox) / s), max(0.0, (y - oy) / s)
-                    x2 = min(float(w), (x - ox + bw) / s)
-                    y2 = min(float(h), (y - oy + bh) / s)
-                    if x2 - x1 < 8 or y2 - y1 < 8:
-                        continue
-                    boxes.append(self._unrotate((x1, y1, x2 - x1, y2 - y1), rot, h0, w0))
-                    scores.append(float(f[14]))
-        if not boxes:
-            return []
-        idxs = cv2.dnn.NMSBoxes([list(map(float, b)) for b in boxes], scores, self.conf, 0.4)
-        return [boxes[i] for i in np.array(idxs).flatten()]
-
-
-class RescueDetector:
-    """主偵測器整幀沒抓到臉時，改用 CloseupRescue 再試一次，並統計觸發／救回次數供處理紀錄使用。"""
-
-    def __init__(self, primary, rescue: CloseupRescue):
-        self.primary = primary
-        self.rescue = rescue
-        self.triggered = 0        # 主偵測沒抓到、啟用補救的幀數
-        self.rescued_frames = 0   # 補救有抓到的幀數
-        self.rescued_boxes = 0    # 補救抓到的框數
-
-    def detect(self, frame: np.ndarray) -> list[tuple[int, int, int, int]]:
         boxes = self.primary.detect(frame)
         if boxes:
             return boxes
         self.triggered += 1
-        boxes = self.rescue.detect(frame)
-        if boxes:
-            self.rescued_frames += 1
-            self.rescued_boxes += len(boxes)
-        return boxes
+        h0, w0 = frame.shape[:2]
+        for rot in list(self.order):
+            found = self.primary.detect(cv2.rotate(frame, self.ROTATIONS[rot]))
+            if found:
+                self.order.remove(rot)
+                self.order.insert(0, rot)
+                self.rescued_frames += 1
+                self.rescued_boxes += len(found)
+                return [self._unrotate(b, rot, h0, w0) for b in found]
+        return []
 
     def stats(self) -> tuple[int, int, int]:
         return self.triggered, self.rescued_frames, self.rescued_boxes
@@ -503,9 +453,8 @@ def create_detector(args, log=None):
       640 那道把它補回來（實測 9 張側臉照從 5 張提升到 8 張），GPU 每幀只多約 14 ms。args.multiscale=False 停用。
     - args.head_conf（預設 0.5）：頭部模型的門檻，與人臉門檻獨立。圓弧物體（椅端、門把、燈罩）多在
       0.5 到 0.6 之間被誤判成頭，室內誤框多時可調到 0.6；真人的頭在中等尺寸下多為 0.65 以上。
-    - args.rescue（預設關）：整幀沒抓到臉時用 CloseupRescue 再試一次。專為手機貼臉自拍、畫面橫躺的
-      特寫設計；在「有人但那一瞬間臉和頭都沒抓到」的幀會把頭髮、衣服框成臉（實測約四成多框），
-      一般拍別人的影片不建議開。
+    - args.rescue（預設關）：整幀沒抓到臉時，把畫面轉 90/270 度用同一套偵測器再跑一次（旋轉補救）。
+      救回橫躺、大角度歪斜的臉；因為是主偵測器覆核，誤框率與一般偵測相同。
     """
     device = getattr(args, "device", "auto")
     parts = []
@@ -521,7 +470,7 @@ def create_detector(args, log=None):
         parts.append(HeadDetector(getattr(args, "head_conf", 0.5), device, log))
     det = parts[0] if len(parts) == 1 else UnionDetector(parts)
     if getattr(args, "rescue", False):
-        det = RescueDetector(det, CloseupRescue())
+        det = RescueDetector(det)
     return det
 
 
@@ -724,7 +673,7 @@ def process_image(path: Path, out_path: Path, detector, args, log=print):
     n = process_frame(img, detector, args)
     cv2.imwrite(str(out_path), img)
     after = rescue_stats(detector)
-    note = "，特寫補救" if before and after and after[1] > before[1] else ""
+    note = "，旋轉補救" if before and after and after[1] > before[1] else ""
     log(f"✓ {path.name} → {out_path.name}（{img.shape[1]}x{img.shape[0]}，偵測到 {n} 張人臉{note}，{time.time() - t0:.2f}s）")
     return n
 
@@ -1192,7 +1141,7 @@ def _process_video_once(path, out_path, detector, args, sink: str, ffmpeg, log, 
     rescue_after = rescue_stats(detector)
     if rescue_before and rescue_after and rescue_after[0] > rescue_before[0]:
         trig, rf, rb = (a - b for a, b in zip(rescue_after, rescue_before))
-        detail += f"；特寫補救觸發 {trig} 幀、救回 {rf} 幀 {rb} 框"
+        detail += f"；旋轉補救觸發 {trig} 幀、救回 {rf} 幀 {rb} 框"
     avg_boxes = stats["covered"] / max(1, written)
     box_note = f"，平均 {avg_boxes:.1f} 框/幀（尖峰 {stats['max_boxes']}）" if avg_boxes >= 3 else ""
     w, h = writer_box["size"]
@@ -1261,8 +1210,8 @@ def main():
     parser.add_argument("--no-multiscale", dest="multiscale", action="store_false",
                         help="停用多尺度：預設 det-size 高於 640 時會再加一道 640 掃描取聯集，補特寫大臉")
     parser.add_argument("--rescue", action="store_true",
-                        help="啟用特寫／旋轉補救：整幀沒抓到臉時，用 YuNet 對 0/90/270 度、縮小畫布再試一次。"
-                             "專為手機貼臉自拍、畫面橫躺的特寫；一般影片會增加誤框，預設關")
+                        help="啟用旋轉補救：整幀沒抓到臉時，把畫面轉 90/270 度用同一套偵測器再跑一次，"
+                             "救回橫躺、大角度歪斜的臉；誤框率與一般偵測相同，預設關")
     parser.add_argument("--device", choices=DEVICE_CHOICES, default="auto",
                         help="偵測運算裝置：auto 有 GPU 就用（macOS CoreML / Windows DirectML）、"
                              "不行自動退回 CPU；gpu 強制用 GPU（不可用時報錯）")
