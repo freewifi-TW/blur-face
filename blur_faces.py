@@ -441,7 +441,11 @@ def create_detector(args, log=None):
     - detector=scrfd / both 時預設多尺度：det-size 高於 640 會再加一道 640 掃描取聯集。SCRFD 的
       訓練畫布是 640、看過的臉最大約 500px，特寫大臉在高解析度掃描下會超出尺度而分數崩掉，
       640 那道把它補回來（實測 9 張側臉照從 5 張提升到 8 張），GPU 每幀只多約 14 ms。args.multiscale=False 停用。
-    - args.rescue（預設開）：整幀沒抓到臉時用 CloseupRescue 再試一次。
+    - args.head_conf（預設 0.5）：頭部模型的門檻，與人臉門檻獨立。圓弧物體（椅端、門把、燈罩）多在
+      0.5 到 0.6 之間被誤判成頭，室內誤框多時可調到 0.6；真人的頭在中等尺寸下多為 0.65 以上。
+    - args.rescue（預設關）：整幀沒抓到臉時用 CloseupRescue 再試一次。專為手機貼臉自拍、畫面橫躺的
+      特寫設計；在「有人但那一瞬間臉和頭都沒抓到」的幀會把頭髮、衣服框成臉（實測約四成多框），
+      一般拍別人的影片不建議開。
     """
     device = getattr(args, "device", "auto")
     parts = []
@@ -454,9 +458,9 @@ def create_detector(args, log=None):
         if log and device != "cpu" and args.detector == "yunet":
             log("YuNet 走 OpenCV DNN，只能用 CPU")
     if getattr(args, "head", False):
-        parts.append(HeadDetector(max(args.conf, 0.35), device, log))
+        parts.append(HeadDetector(getattr(args, "head_conf", 0.5), device, log))
     det = parts[0] if len(parts) == 1 else UnionDetector(parts)
-    if getattr(args, "rescue", True):
+    if getattr(args, "rescue", False):
         det = RescueDetector(det, CloseupRescue())
     return det
 
@@ -550,18 +554,25 @@ class StreamTracker:
     同一個人跨幀以 IoU 串成軌跡；軌跡中短暫漏偵測（≤ max_gap 幀）的幀用前後幀線性內插補齊，
     軌跡起點往前、終點往後各延伸 extend 幀。結果與「全片偵測完再回頭補洞」的離線做法完全相同，
     但只需暫存 delay 幀畫面，影片只要解碼一遍。
+
+    min_hits：一條軌跡至少要被偵測到幾幀才輸出（預設 2）。只出現一幀的框幾乎都是誤判（圓弧物體、
+    紋理），而追蹤補洞會把它往前後各延伸 extend 幀、放大成 13 幀的馬賽克塊；真臉幾乎每幀都會被
+    偵測到，不受影響。
     """
 
-    def __init__(self, iou_thresh: float = 0.3, max_gap: int = 15, extend: int = 6):
+    def __init__(self, iou_thresh: float = 0.3, max_gap: int = 15, extend: int = 6, min_hits: int = 2):
         self.iou_thresh = iou_thresh
         self.max_gap = max_gap
         self.extend = extend
+        self.min_hits = max(1, min_hits)
         # 內插最多回頭改 max_gap-1 幀、起點延伸最多回頭 extend 幀；一條軌跡要等 max_gap 幀沒續接
         # 才能確定結束（終點延伸），所以延遲 max_gap+1 幀後該幀的框就全部確定了。
-        self.delay = max_gap + 1
-        self.tracks: list[dict] = []        # {"boxes": {幀號: box}, "last": 最後偵測到的幀號}
+        # 有最少命中數要求時，起點往前延伸到幀 e 的軌跡最晚在 e+extend 才首次出現、再 max_gap 幀
+        # 才知道有沒有第二次偵測，所以要多等 extend 幀。
+        self.delay = max_gap + 1 + (extend if self.min_hits > 1 else 0)
+        self.tracks: list[dict] = []        # {"boxes": {幀號: box}, "last": 最後偵測到的幀號, "hits": 偵測次數}
         self.pending: deque = deque()       # 尚未輸出的 (幀號, 畫面)
-        self.boxes: dict[int, list] = {}    # 幀號 -> 已確定的遮蔽框（偵測 + 內插 + 起點延伸）
+        self.boxes: dict[int, list] = {}    # 幀號 -> [(軌跡, 框)]（偵測 + 內插 + 起點延伸），輸出時依 hits 過濾
         self.idx = 0
 
     def push(self, frame: np.ndarray, detections: list) -> list[tuple[np.ndarray, list]]:
@@ -587,21 +598,23 @@ class StreamTracker:
             a, box_a = t["last"], t["boxes"][t["last"]]
             for i in range(a + 1, idx):  # 漏偵測的幀：線性內插
                 w = (i - a) / (idx - a)
-                self.boxes[i].append(tuple(
+                self.boxes[i].append((t, tuple(
                     int(round(pa * (1 - w) + pb * w)) for pa, pb in zip(box_a, box)
-                ))
+                )))
             t["boxes"][idx] = box
             t["last"] = idx
-            frame_boxes.append(box)
+            t["hits"] += 1
+            frame_boxes.append((t, box))
             used_t.add(ti)
             used_b.add(bi)
         for bi, box in enumerate(detections):
             if bi in used_b:
                 continue
-            self.tracks.append({"boxes": {idx: box}, "last": idx})
-            frame_boxes.append(box)
+            t = {"boxes": {idx: box}, "last": idx, "hits": 1}
+            self.tracks.append(t)
+            frame_boxes.append((t, box))
             for i in range(max(0, idx - self.extend), idx):  # 軌跡起點往前延伸
-                self.boxes[i].append(box)
+                self.boxes[i].append((t, box))
 
         out = self._emit(idx - self.delay)
         # 已結束且終點延伸也輸出完的軌跡可以丟掉
@@ -616,10 +629,10 @@ class StreamTracker:
         out = []
         while self.pending and self.pending[0][0] <= upto:
             e, frame = self.pending.popleft()
-            boxes = self.boxes.pop(e, [])
+            boxes = [b for t, b in self.boxes.pop(e, []) if t["hits"] >= self.min_hits]
             for t in self.tracks:  # 已結束軌跡的終點往後延伸
                 a = t["last"]
-                if a < e <= a + self.extend:
+                if a < e <= a + self.extend and t["hits"] >= self.min_hits:
                     boxes.append(t["boxes"][a])
             out.append((frame, boxes))
         return out
@@ -771,7 +784,7 @@ def _iter_censored_frames(cap, detector, args, cancel, stats: dict, report):
     追蹤模式經 StreamTracker 線上補洞，輸出比讀入延遲 delay 幀，影片只需解碼一遍；
     非追蹤模式逐幀處理並用 sticky_boxes 補償。stats 累計 frames_read / faces / covered / cancelled。
     """
-    tracker = StreamTracker() if getattr(args, "track", True) else None
+    tracker = StreamTracker(min_hits=getattr(args, "min_hits", 2)) if getattr(args, "track", True) else None
     sticky: list = []
     while True:
         if cancel is not None and cancel():
@@ -938,12 +951,17 @@ def main():
     parser.add_argument("--ellipse", action="store_true", help="使用橢圓形遮罩（預設矩形）")
     parser.add_argument("--head", action="store_true",
                         help="加上頭部偵測（含背對鏡頭、極端角度），遮蔽範圍從臉擴大到整顆頭")
+    parser.add_argument("--head-conf", type=float, default=0.5,
+                        help="頭部偵測門檻（與 --conf 獨立）；室內圓弧物體被誤當成頭時調高到 0.6")
     parser.add_argument("--no-track", dest="track", action="store_false",
                         help="停用影片追蹤補洞，改回逐幀即時處理")
+    parser.add_argument("--min-hits", type=int, default=2,
+                        help="影片中一條軌跡至少要被偵測到幾幀才輸出；只出現一幀的框多為誤判，設 1 停用過濾")
     parser.add_argument("--no-multiscale", dest="multiscale", action="store_false",
                         help="停用多尺度：預設 det-size 高於 640 時會再加一道 640 掃描取聯集，補特寫大臉")
-    parser.add_argument("--no-rescue", dest="rescue", action="store_false",
-                        help="停用特寫／旋轉補救：預設整幀沒抓到臉時，用 YuNet 對 0/90/270 度、縮小畫布再試一次")
+    parser.add_argument("--rescue", action="store_true",
+                        help="啟用特寫／旋轉補救：整幀沒抓到臉時，用 YuNet 對 0/90/270 度、縮小畫布再試一次。"
+                             "專為手機貼臉自拍、畫面橫躺的特寫；一般影片會增加誤框，預設關")
     parser.add_argument("--device", choices=DEVICE_CHOICES, default="auto",
                         help="偵測運算裝置：auto 有 GPU 就用（macOS CoreML / Windows DirectML）、"
                              "不行自動退回 CPU；gpu 強制用 GPU（不可用時報錯）")

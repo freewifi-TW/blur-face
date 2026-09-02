@@ -275,25 +275,41 @@ class MainWindow(QMainWindow):
             "背對鏡頭、側面、低頭的人也會被遮蔽 — 隱私保護建議開啟\n"
             "關閉後只遮有偵測到臉的人"
         )
-        grid.addWidget(self.head, 3, 0, 1, 2)
+        grid.addWidget(self.head, 3, 0)
+
+        self.head_conf = QSlider(Qt.Horizontal)
+        self.head_conf.setRange(30, 80)
+        self.head_conf.setValue(50)
+        self.head_conf_lbl = QLabel("0.50")
+        self.head_conf.valueChanged.connect(lambda v: self.head_conf_lbl.setText(f"{v / 100:.2f}"))
+        self.head.toggled.connect(self.head_conf.setEnabled)
+        for w in (self.head_conf, self.head_conf_lbl):
+            w.setToolTip(
+                "頭部模型的信心門檻（0.30–0.80），與上面的人臉門檻獨立\n"
+                "門把、燈罩、椅背、球這類圓弧物體常在 0.5–0.6 被誤當成頭\n"
+                "室內誤框太多→調到 0.60；真人的頭在一般大小下多半 0.65 以上"
+            )
+        grid.addWidget(self.head_conf, 3, 1)
+        grid.addWidget(self.head_conf_lbl, 3, 2)
 
         self.track = QCheckBox("影片追蹤補洞")
         self.track.setChecked(True)
         self.track.setToolTip(
-            "影片先整部偵測、把同一個人在時間軸上串成軌跡，\n"
-            "短暫漏偵測的幀用前後幀位置自動補齊，避免馬賽克閃爍或漏幀\n"
+            "邊偵測邊把同一個人在時間軸上串成軌跡，\n"
+            "短暫漏偵測的幀用前後幀位置自動補齊，避免馬賽克閃爍或漏幀；\n"
+            "只出現一幀的框視為誤判不輸出\n"
             "建議開啟；關閉則改為逐幀即時處理"
         )
-        grid.addWidget(self.track, 3, 2)
+        grid.addWidget(self.track, 3, 3)
 
         self.rescue = QCheckBox("特寫／旋轉補救")
-        self.rescue.setChecked(True)
+        self.rescue.setChecked(False)
         self.rescue.setToolTip(
             "整幅畫面都沒抓到臉時，改用另一個模型對轉正、縮小後的畫面再試一次\n"
-            "專門救「臉比畫面還大、手機橫躺 90 度、臉被裁掉一半」的極端特寫\n"
-            "只在沒抓到的幀執行，正常畫面不受影響；沒有人的片段每幀會多約 0.08 秒"
+            "專門救「手機貼在臉上自拍、畫面橫躺 90 度、臉被裁掉一半」的極端特寫\n"
+            "一般拍別人的影片不建議開：人物背對或低頭的瞬間，它可能把頭髮、衣服框成臉"
         )
-        grid.addWidget(self.rescue, 3, 3)
+        grid.addWidget(self.rescue, 4, 3)
 
         self.gpu = QCheckBox("GPU 加速偵測")
         self.gpu.setChecked(True)
@@ -417,7 +433,9 @@ class MainWindow(QMainWindow):
             keep=4,
             ellipse=self.ellipse.isChecked(),
             head=self.head.isChecked(),
+            head_conf=self.head_conf.value() / 100,
             track=self.track.isChecked(),
+            min_hits=2,
             device="auto" if self.gpu.isChecked() else "cpu",
             encoder="auto" if self.hw_encode.isChecked() else "software",
             multiscale=True,
@@ -440,11 +458,11 @@ class MainWindow(QMainWindow):
             self.logged_env = True
         self.append_log(
             f"開始處理 {len(self.files)} 個檔案 · 偵測器 {args.detector} · 解析度 {args.det_size} · "
-            f"門檻 {args.conf:.2f} · 頭部 {'開' if args.head else '關'} · 追蹤 {'開' if args.track else '關'} · "
-            f"補救 {'開' if args.rescue else '關'} · "
+            f"門檻 {args.conf:.2f} · 頭部 {('開 ' + format(args.head_conf, '.2f')) if args.head else '關'} · "
+            f"追蹤 {'開' if args.track else '關'} · 補救 {'開' if args.rescue else '關'} · "
             f"裝置 {args.device} · 編碼 {args.encoder} · 輸出 {self.out_dir or '原檔旁'}"
         )
-        key = (args.detector, args.det_size, args.conf, args.head, args.device, args.rescue)
+        key = (args.detector, args.det_size, args.conf, args.head, args.head_conf, args.device, args.rescue)
         if key != self.detector_key:
             if self.cached_detector is not None:
                 self.append_log("偵測設定已變更，釋放舊偵測器後重建")
@@ -489,6 +507,7 @@ class MainWindow(QMainWindow):
         for w in (self.mode, self.strength, self.detector, self.det_size, self.conf,
                   self.ellipse, self.head, self.track, self.rescue, self.gpu, self.hw_encode, self.out_btn):
             w.setEnabled(not busy)
+        self.head_conf.setEnabled(not busy and self.head.isChecked())
 
 
 def smoke_test() -> int:
