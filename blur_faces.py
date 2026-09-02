@@ -8,6 +8,7 @@
 """
 
 import argparse
+import queue
 import shutil
 import subprocess
 import sys
@@ -366,9 +367,22 @@ class UnionDetector:
 
     def __init__(self, detectors: list):
         self.detectors = detectors
+        # 各子偵測器需要的輸入長邊上限。detect() 先把原始幀縮到這個尺寸「一次」讓大家共用，
+        # 4K 幀不再被每個子偵測器各自縮圖一遍（4K→1280 一次約 5-10ms，三個模型省兩次）
+        self.max_side = max(
+            getattr(d, "det_size", None) or getattr(d, "INPUT", None) or getattr(d, "MAX_SIDE", 1280)
+            for d in detectors
+        )
 
     def detect(self, frame: np.ndarray) -> list[tuple[int, int, int, int]]:
-        boxes = [b for d in self.detectors for b in d.detect(frame)]
+        h, w = frame.shape[:2]
+        s = min(1.0, self.max_side / max(h, w))
+        src = frame
+        if s < 1.0:
+            src = cv2.resize(frame, (max(1, round(w * s)), max(1, round(h * s))), interpolation=cv2.INTER_AREA)
+        boxes = [b for d in self.detectors for b in d.detect(src)]
+        if s < 1.0:
+            boxes = [tuple(int(v / s) for v in b) for b in boxes]
         if not boxes:
             return []
         # 用 NMS 去除高度重疊的重複框，分數一律 1.0（只做去重）
@@ -420,21 +434,27 @@ class CloseupRescue:
             imr = frame if code is None else cv2.rotate(frame, code)
             h, w = imr.shape[:2]
             for scale in self.scales:
-                H, W = int(h * scale), int(w * scale)
-                oy, ox = (H - h) // 2, (W - w) // 2
+                # 幾何上等價於「把原圖貼進 scale 倍大的畫布中央、再把畫布縮到 MAX_SIDE 內」，
+                # 但改為先縮小影像再貼小畫布：4K 來源省下每個旋轉 33MP（約 100MB）的
+                # 畫布配置與一次 8K 級縮圖，補救成本從每幀數百 ms 降到數十 ms
+                side = min(self.MAX_SIDE, int(max(h, w) * scale))
+                s = side / scale / max(h, w)  # 原圖 → 畫布內影像的縮放比例
+                nw, nh = max(1, round(w * s)), max(1, round(h * s))
+                W, H = round(nw * scale), round(nh * scale)
+                oy, ox = (H - nh) // 2, (W - nw) // 2
                 canvas = np.full((H, W, 3), 114, dtype=np.uint8)
-                canvas[oy:oy + h, ox:ox + w] = imr
-                s = min(1.0, self.MAX_SIDE / max(H, W))
-                if s < 1.0:
-                    canvas = cv2.resize(canvas, (int(W * s), int(H * s)))
-                self.detector.setInputSize((canvas.shape[1], canvas.shape[0]))
+                canvas[oy:oy + nh, ox:ox + nw] = (
+                    cv2.resize(imr, (nw, nh), interpolation=cv2.INTER_AREA) if (nw, nh) != (w, h) else imr
+                )
+                self.detector.setInputSize((W, H))
                 _, faces = self.detector.detect(canvas)
                 if faces is None:
                     continue
                 for f in faces:
-                    x, y, bw, bh = f[:4] / s
-                    x1, y1 = max(0.0, x - ox), max(0.0, y - oy)
-                    x2, y2 = min(float(w), x - ox + bw), min(float(h), y - oy + bh)
+                    x, y, bw, bh = f[:4]
+                    x1, y1 = max(0.0, (x - ox) / s), max(0.0, (y - oy) / s)
+                    x2 = min(float(w), (x - ox + bw) / s)
+                    y2 = min(float(h), (y - oy + bh) / s)
                     if x2 - x1 < 8 or y2 - y1 < 8:
                         continue
                     boxes.append(self._unrotate((x1, y1, x2 - x1, y2 - y1), rot, h0, w0))
@@ -841,11 +861,12 @@ PHASES = {
 
 
 class _Heartbeat:
-    """背景執行緒：定期回報處理進度，並在畫面長時間沒有推進時指出卡在哪個階段。
+    """背景執行緒：定期回報處理進度，並在長時間沒有進展時指出卡在哪個階段。
 
-    stats 由主迴圈更新：frames_read（已解碼幀數）、phase（目前階段 key）、t_advance（最後一次
-    有新幀的時刻）。主迴圈若卡在某次 cap.read() 或 session.run()（例如壞幀、DirectML 卡住），
-    幀數會停止推進，這個執行緒仍會每隔幾秒印出「已 Xs 沒有新畫面，卡在【偵測】」。
+    stats 由管線各執行緒更新：frames_read（已解碼）、written（已輸出）、t_advance（最後一次
+    有進展的時刻）、_q_dec / _q_out（管線佇列，滿了代表下游追不上，用來判斷瓶頸）。
+    任一階段卡死（壞幀、DirectML 卡住、ffmpeg 沒反應）時 t_advance 停止推進，
+    這個執行緒仍會印出「已 Xs 沒有進展，可能卡在【某階段】」與佇列狀態。
     """
 
     def __init__(self, log, stats: dict, total: int, interval: float = 15.0, stall_after: float = 20.0):
@@ -875,6 +896,20 @@ class _Heartbeat:
         top = [f"{zh} {v:.0%}" for zh, v in seg[:3] if v >= 0.05]
         return f"，累計 {'、'.join(top)}" if top else ""
 
+    def _where(self) -> str:
+        """判斷目前在忙／卡住的階段。管線模式看佇列狀態（滿＝下游追不上），否則退回 phase 標籤。"""
+        phase = self.stats.get("phase")
+        if phase in ("finalize", "done"):
+            return PHASES[phase]
+        qd, qo = self.stats.get("_q_dec"), self.stats.get("_q_out")
+        if qd is None or qo is None:
+            return PHASES.get(phase, phase or "?")
+        if qo.full():
+            return PHASES["write"]   # 輸出佇列滿：編碼寫入跟不上
+        if qd.full():
+            return PHASES["detect"]  # 解碼佇列滿：偵測跟不上
+        return PHASES["decode"]      # 兩條都空：解碼供不上
+
     def _run(self):
         t_start = time.time()
         last_report = t_start
@@ -883,7 +918,8 @@ class _Heartbeat:
         while not self._stop.wait(3.0):
             now = time.time()
             frames = self.stats["frames_read"]
-            phase = PHASES.get(self.stats.get("phase"), self.stats.get("phase", "?"))
+            written = self.stats.get("written", 0)
+            where = self._where()
             since_advance = now - self.stats.get("t_advance", t_start)
             if since_advance < self.stall_after:
                 stalled = False
@@ -902,12 +938,16 @@ class _Heartbeat:
                 extra += self._stage_shares(el)
                 if rss:
                     extra += f"，記憶體 {rss:.0f}MB"
-                self.log(f"⏳ 進度 {pct}（{frames} 幀，即時 {inst:.1f} fps、平均 {avg:.1f} fps，"
-                         f"目前【{phase}】{extra}{eta}）")
+                self.log(f"⏳ 進度 {pct}（解碼 {frames}、輸出 {written} 幀，即時 {inst:.1f} fps、"
+                         f"平均 {avg:.1f} fps，瓶頸【{where}】{extra}{eta}）")
             elif not stalled or now - last_report >= self.interval:
                 # 一進入卡住狀態立刻警告，之後每 interval 秒重複一次（原本每 3 秒洗版）
-                self.log(f"⚠ 已 {since_advance:.0f} 秒沒有新畫面產出，可能卡在【{phase}】"
-                         f"（已處理 {frames}" + (f"/{self.total}" if self.total > 0 else "") + " 幀）")
+                qd, qo = self.stats.get("_q_dec"), self.stats.get("_q_out")
+                qinfo = (f"，佇列 {qd.qsize()}/{qd.maxsize}·{qo.qsize()}/{qo.maxsize}"
+                         if qd is not None and qo is not None else "")
+                self.log(f"⚠ 已 {since_advance:.0f} 秒沒有進展，可能卡在【{where}】"
+                         f"（解碼 {frames}" + (f"/{self.total}" if self.total > 0 else "") +
+                         f" 幀、輸出 {written} 幀{qinfo}）")
                 stalled = True
             else:
                 continue
@@ -915,60 +955,28 @@ class _Heartbeat:
             last_frames = frames
 
 
-def _iter_censored_frames(cap, detector, args, cancel, stats: dict, report):
-    """讀取影片、偵測、（追蹤補洞）、打碼，依序 yield 打好碼的畫面。
+def _open_video(path: Path, log):
+    """開啟影片，優先用 FFmpeg 後端的硬體加速解碼（NVDEC / D3D11 / QSV，由 FFmpeg 自選）。
 
-    追蹤模式經 StreamTracker 線上補洞，輸出比讀入延遲 delay 幀，影片只需解碼一遍；
-    非追蹤模式逐幀處理並用 sticky_boxes 補償。stats 累計 frames_read / faces / covered / cancelled。
+    先開一次並試讀第一幀確認可用，再重開一次從頭讀；試讀失敗（驅動或格式不支援）
+    就退回預設開法。VIDEO_ACCELERATION_ANY 本身允許 FFmpeg 內部退回軟解，這裡的
+    失敗處理只是保險。
     """
-    tracker = StreamTracker(min_hits=getattr(args, "min_hits", 2)) if getattr(args, "track", True) else None
-    sticky: list = []
-    while True:
-        if cancel is not None and cancel():
-            stats["cancelled"] = True
-            return
-        stats["phase"] = "decode"
-        t0 = time.time()
-        ok, frame = cap.read()
-        stats["t_decode"] += time.time() - t0
-        if not ok:
-            break
-        stats["frames_read"] += 1
-        stats["t_advance"] = time.time()
-        report(stats["frames_read"])
-        if tracker is None:
-            stats["phase"] = "detect"
-            t0 = time.time()
-            stats["faces"] += process_frame(frame, detector, args, sticky)
-            stats["t_detect"] += time.time() - t0
-            yield frame
-            continue
-        stats["phase"] = "detect"
-        t0 = time.time()
-        boxes = detector.detect(frame)
-        stats["t_detect"] += time.time() - t0
-        stats["faces"] += len(boxes)
-        stats["phase"] = "track"
-        t0 = time.time()
-        emitted = tracker.push(frame, boxes)
-        stats["t_track"] += time.time() - t0
-        for out_frame, out_boxes in emitted:
-            stats["covered"] += len(out_boxes)
-            stats["last_boxes"] = len(out_boxes)
-            stats["last_max_side"] = max((max(b[2], b[3]) for b in out_boxes), default=0)
-            stats["max_boxes"] = max(stats["max_boxes"], len(out_boxes))
-            stats["phase"] = "censor"
-            t0 = time.time()
-            apply_boxes(out_frame, out_boxes, args)
-            stats["t_censor"] += time.time() - t0
-            yield out_frame
-    if tracker is not None:
-        for out_frame, out_boxes in tracker.flush():
-            stats["covered"] += len(out_boxes)
-            t0 = time.time()
-            apply_boxes(out_frame, out_boxes, args)
-            stats["t_censor"] += time.time() - t0
-            yield out_frame
+    if hasattr(cv2, "CAP_PROP_HW_ACCELERATION"):
+        params = [cv2.CAP_PROP_HW_ACCELERATION, cv2.VIDEO_ACCELERATION_ANY]
+        try:
+            cap = cv2.VideoCapture(str(path), cv2.CAP_FFMPEG, params)
+            ok = cap.isOpened() and cap.read()[0]
+            cap.release()
+            if ok:
+                cap = cv2.VideoCapture(str(path), cv2.CAP_FFMPEG, params)
+                if cap.isOpened():
+                    log("解碼：FFmpeg 硬體加速優先（不支援的格式由 FFmpeg 自動退回軟解）")
+                    return cap
+                cap.release()
+        except Exception:  # noqa: BLE001 — 任何失敗都退回預設開法
+            pass
+    return cv2.VideoCapture(str(path))
 
 
 _RETRY = object()  # _process_video_once 的回傳哨兵：ffmpeg 編碼失敗，請改用 OpenCV 重跑
@@ -977,7 +985,7 @@ _RETRY = object()  # _process_video_once 的回傳哨兵：ffmpeg 編碼失敗�
 def _process_video_once(path, out_path, detector, args, sink: str, ffmpeg, log, progress, cancel):
     encoder = pick_encoder(getattr(args, "encoder", "auto")) if sink == "ffmpeg" else None
 
-    cap = cv2.VideoCapture(str(path))
+    cap = _open_video(path, log)
     if not cap.isOpened():
         log(f"⚠ 無法開啟影片：{path}")
         return None
@@ -987,9 +995,9 @@ def _process_video_once(path, out_path, detector, args, sink: str, ffmpeg, log, 
     w0, h0 = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     dur = f"（約 {total / fps:.0f}s）" if total > 0 and fps > 0 else ""
     log(f"▶ {path.name}：{w0}x{h0}，{fps:.0f} fps，共 {total} 幀{dur}")
-    stats = {"frames_read": 0, "faces": 0, "covered": 0, "cancelled": False,
+    stats = {"frames_read": 0, "written": 0, "faces": 0, "covered": 0, "cancelled": False,
              "t_decode": 0.0, "t_detect": 0.0, "t_track": 0.0, "t_censor": 0.0,
-             "t_tobytes": 0.0, "t_pipe": 0.0, "phase": "decode", "t_advance": time.time(),
+             "t_tobytes": 0.0, "t_pipe": 0.0, "phase": None, "t_advance": time.time(),
              "last_boxes": 0, "max_boxes": 0, "last_max_side": 0}
     rescue_before = rescue_stats(detector)
     t_start = time.time()
@@ -999,59 +1007,171 @@ def _process_video_once(path, out_path, detector, args, sink: str, ffmpeg, log, 
             progress(done, total)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    writer = None
-    written = 0
-    error = None
-    t_finalize = 0.0
-    try:
-        with _Heartbeat(log, stats, total):
-            for frame in _iter_censored_frames(cap, detector, args, cancel, stats, report):
-                if writer is None:
+
+    # --- 三段式管線：解碼 → 偵測+追蹤 → 打碼+編碼，各在自己的執行緒重疊執行 ---
+    # cap.read / onnxruntime session.run / cv2 運算都會釋放 GIL，執行緒化是真併行；
+    # 原本單執行緒串行時各階段互等，CPU 與 GPU 都吃不滿。佇列刻意小（4K 幀約 24MB），
+    # 佔記憶體有限、滿了自然形成背壓；哪條佇列滿也讓心跳能指出瓶頸在哪一段。
+    q_dec: queue.Queue = queue.Queue(maxsize=4)   # 解碼 → 偵測
+    q_out: queue.Queue = queue.Queue(maxsize=4)   # 追蹤輸出（幀+框）→ 打碼+編碼
+    stats["_q_dec"], stats["_q_out"] = q_dec, q_out
+    stop = threading.Event()
+    fail: dict[str, str] = {}
+    writer_box: dict = {}
+
+    def _put(q, item) -> bool:
+        """帶背壓的 put：佇列滿就等，任一階段失敗（stop）立即放棄。"""
+        while not stop.is_set():
+            try:
+                q.put(item, timeout=0.2)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def _get(q):
+        while not stop.is_set():
+            try:
+                return q.get(timeout=0.2)
+            except queue.Empty:
+                continue
+        return None  # 停止時視同資料結束
+
+    def decode_loop():
+        try:
+            while True:
+                if cancel is not None and cancel():
+                    stats["cancelled"] = True
+                    break
+                t0 = time.time()
+                ok, frame = cap.read()
+                stats["t_decode"] += time.time() - t0
+                if not ok:
+                    break
+                stats["frames_read"] += 1
+                stats["t_advance"] = time.time()
+                report(stats["frames_read"])
+                if not _put(q_dec, frame):
+                    return
+        except Exception as e:  # noqa: BLE001
+            fail["decode"] = f"解碼失敗：{e}"
+            stop.set()
+        finally:
+            _put(q_dec, None)
+
+    def detect_loop():
+        """跑在呼叫者執行緒：偵測器與建立它的執行緒相同，GUI 跨輪沿用行為不變。"""
+        tracker = StreamTracker(min_hits=getattr(args, "min_hits", 2)) if getattr(args, "track", True) else None
+        sticky: list = []
+        try:
+            while True:
+                frame = _get(q_dec)
+                if frame is None:
+                    break
+                t0 = time.time()
+                boxes = detector.detect(frame)
+                stats["t_detect"] += time.time() - t0
+                stats["faces"] += len(boxes)
+                if tracker is not None:
+                    t0 = time.time()
+                    emitted = tracker.push(frame, boxes)
+                    stats["t_track"] += time.time() - t0
+                else:
+                    # 逐幀模式：偵測框延續 keep 幀補空窗（原 process_frame 的 sticky 邏輯）
+                    sticky[:] = [(b, ttl - 1) for b, ttl in sticky if ttl > 1]
+                    sticky.extend((b, args.keep) for b in boxes)
+                    emitted = [(frame, [b for b, _ in sticky])]
+                for item in emitted:
+                    if not _put(q_out, item):
+                        return
+            if tracker is not None and not stats["cancelled"] and not fail:
+                for item in tracker.flush():
+                    if not _put(q_out, item):
+                        return
+        except Exception as e:  # noqa: BLE001
+            fail["detect"] = f"偵測失敗：{e}"
+            stop.set()
+        finally:
+            _put(q_out, None)
+
+    def write_loop():
+        try:
+            while True:
+                item = _get(q_out)
+                if item is None:
+                    break
+                frame, boxes = item
+                stats["covered"] += len(boxes)
+                stats["last_boxes"] = len(boxes)
+                stats["last_max_side"] = max((max(b[2], b[3]) for b in boxes), default=0)
+                stats["max_boxes"] = max(stats["max_boxes"], len(boxes))
+                t0 = time.time()
+                apply_boxes(frame, boxes, args)
+                stats["t_censor"] += time.time() - t0
+                if "writer" not in writer_box:
                     # 直式手機影片帶旋轉 metadata 時 CAP_PROP 的寬高可能與實際幀不符，以第一幀實際尺寸為準
                     h, w = frame.shape[:2]
-                    if sink == "ffmpeg":
-                        writer = _FfmpegWriter(ffmpeg, out_path, path, fps, (w, h), encoder)
-                    else:
-                        writer = _Cv2Writer(out_path, fps, (w, h))
-                stats["phase"] = "write"
+                    writer_box["size"] = (w, h)
+                    writer_box["writer"] = (
+                        _FfmpegWriter(ffmpeg, out_path, path, fps, (w, h), encoder)
+                        if sink == "ffmpeg" else _Cv2Writer(out_path, fps, (w, h))
+                    )
                 if sink == "ffmpeg":
                     t0 = time.time()
-                    raw = frame.tobytes()          # BGR → bytes：純 CPU / 記憶體頻寬
+                    raw = frame.tobytes()                  # BGR → bytes：純 CPU / 記憶體頻寬
                     stats["t_tobytes"] += time.time() - t0
                     t0 = time.time()
-                    writer.write_raw(raw)          # 送進 ffmpeg：卡在這裡代表編碼器跟不上（背壓）
+                    writer_box["writer"].write_raw(raw)    # 卡在這裡代表編碼器跟不上（背壓）
                     stats["t_pipe"] += time.time() - t0
                 else:
                     t0 = time.time()
-                    writer.write(frame)
+                    writer_box["writer"].write(frame)
                     stats["t_pipe"] += time.time() - t0
-                written += 1
-            stats["phase"] = "finalize"
-            t0 = time.time()
-    except (BrokenPipeError, OSError) as e:
-        error = str(e)
-    finally:
+                stats["written"] += 1
+                stats["t_advance"] = time.time()
+        except Exception as e:  # noqa: BLE001 — 常見為 ffmpeg 中途掛掉的 BrokenPipeError
+            fail["write"] = str(e)
+            stop.set()
+
+    writer = None
+    t_finalize = 0.0
+    with _Heartbeat(log, stats, total):
+        threads = [threading.Thread(target=decode_loop, daemon=True),
+                   threading.Thread(target=write_loop, daemon=True)]
+        for t in threads:
+            t.start()
+        detect_loop()
+        for t in threads:
+            t.join()
         cap.release()
+        stats["phase"] = "finalize"
+        writer = writer_box.get("writer")
+        writer_err = None
         if writer is not None:
             _t = time.time()
-            err = writer.close(abort=stats["cancelled"] or error is not None)
+            writer_err = writer.close(abort=stats["cancelled"] or bool(fail))
             t_finalize = time.time() - _t
-            error = err or error
     stats["phase"] = "done"
+    written = stats["written"]
+    error = writer_err or fail.get("write")
     elapsed = max(time.time() - t_start, 1e-9)
     stats["t_write"] = stats["t_tobytes"] + stats["t_pipe"]
-    # 逐階段佔比，涵蓋 100%：解碼 / 偵測 / 追蹤補洞 / 打碼 / 轉bytes / 送編碼 / 收尾ffmpeg，剩下算「其他」
+    # 各階段「忙碌時間」佔整體耗時的比例。管線並行後各階段重疊執行，總和可以超過 100%；
+    # 佔比最高的那項就是目前的瓶頸
     timed = [("解碼", "t_decode"), ("偵測", "t_detect"), ("追蹤", "t_track"), ("打碼", "t_censor"),
              ("轉bytes", "t_tobytes"), ("送編碼", "t_pipe")]
-    accounted = sum(stats[v] for _, v in timed) + t_finalize
-    other = max(0.0, elapsed - accounted)
-    seg = [(zh, stats[v]) for zh, v in timed] + [("收尾", t_finalize), ("其他", other)]
+    seg = [(zh, stats[v]) for zh, v in timed] + [("收尾", t_finalize)]
     parts = ", ".join(f"{zh} {t / elapsed:.0%}" for zh, t in seg if t / elapsed >= 0.005)
 
     if stats["cancelled"]:
         out_path.unlink(missing_ok=True)
         log(f"⚠ 已取消：{path.name}（已解碼 {stats['frames_read']} 幀、輸出 {written} 幀，"
-            f"{elapsed:.1f}s；{parts}）")
+            f"{elapsed:.1f}s；忙碌佔比 {parts}）")
+        return None
+    if fail.get("decode") or fail.get("detect"):
+        # 解碼/偵測層的錯誤換編碼器也救不回來，不走 ffmpeg 重試
+        out_path.unlink(missing_ok=True)
+        log(f"⚠ 無法處理 {path.name}：{fail.get('decode') or fail.get('detect')}")
         return None
     if error is not None:
         out_path.unlink(missing_ok=True)
@@ -1075,8 +1195,9 @@ def _process_video_once(path, out_path, detector, args, sink: str, ffmpeg, log, 
         detail += f"；特寫補救觸發 {trig} 幀、救回 {rf} 幀 {rb} 框"
     avg_boxes = stats["covered"] / max(1, written)
     box_note = f"，平均 {avg_boxes:.1f} 框/幀（尖峰 {stats['max_boxes']}）" if avg_boxes >= 3 else ""
+    w, h = writer_box["size"]
     log(f"✓ {path.name} → {out_path.name}（{w}x{h}，共 {written} 幀，{elapsed:.1f}s ≈ {written / elapsed:.1f} fps；"
-        f"{parts}{box_note}；{detail}；編碼 {writer.encoder}）")
+        f"忙碌佔比 {parts}{box_note}；{detail}；編碼 {writer.encoder}）")
     return written, stats["faces"]
 
 
