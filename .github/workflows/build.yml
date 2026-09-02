@@ -47,6 +47,8 @@ jobs:
       - name: Verify bootloader differs from official wheel (Windows)
         if: runner.os == 'Windows'
         shell: bash
+        env:
+          PYTHONUTF8: "1"  # Windows 主控台預設 cp1252，print 中文會 UnicodeEncodeError
         run: |
           python - <<'EOF'
           import hashlib, pathlib, subprocess, sys, zipfile
