@@ -6,7 +6,9 @@
 """
 
 import argparse
+import faulthandler
 import gc
+import os
 import sys
 import time
 import traceback
@@ -27,6 +29,23 @@ from blur_faces import (
 )
 
 MEDIA_EXTS = IMAGE_EXTS | VIDEO_EXTS
+
+# 處理紀錄與崩潰追蹤同步寫到這裡：GUI 閃退（原生層崩潰）時視窗內的紀錄會消失，檔案是唯一線索
+LOG_DIR = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "BlurFace"
+_crash_file = None  # 保持開啟，faulthandler 需要存活的檔案物件
+
+
+def enable_crash_log():
+    """啟用 faulthandler：原生崩潰（存取違規等 Python 攔不到的錯誤）時把各執行緒堆疊寫進 crash.log。"""
+    global _crash_file
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        _crash_file = open(LOG_DIR / "crash.log", "a", encoding="utf-8", errors="replace")
+        _crash_file.write(f"\n===== {datetime.now():%Y-%m-%d %H:%M:%S} 啟動 =====\n")
+        _crash_file.flush()
+        faulthandler.enable(_crash_file, all_threads=True)
+    except Exception:  # noqa: BLE001 — 紀錄失敗不影響主程式
+        _crash_file = None
 
 DETECTOR_CHOICES = [
     ("高準確度（SCRFD，建議）", "scrfd"),
@@ -178,6 +197,12 @@ class MainWindow(QMainWindow):
         self.cached_detector = None   # 跨輪沿用的偵測器（見 Worker.__init__ 說明）；self.detector 是下拉選單
         self.detector_key = None      # 建立該偵測器時的設定，設定變了才重建
         self.logged_env = False
+        try:  # 處理紀錄同步落檔：閃退後視窗紀錄消失，檔案裡還在
+            self._logfile = open(LOG_DIR / "blurface.log", "a", encoding="utf-8", errors="replace")
+            self._logfile.write(f"\n===== {datetime.now():%Y-%m-%d %H:%M:%S} 啟動 =====\n")
+            self._logfile.flush()
+        except Exception:  # noqa: BLE001
+            self._logfile = None
 
         root = QWidget()
         self.setCentralWidget(root)
@@ -455,7 +480,14 @@ class MainWindow(QMainWindow):
         )
 
     def append_log(self, text: str):
-        self.log.appendPlainText(f"[{datetime.now():%H:%M:%S}] {text}")
+        line = f"[{datetime.now():%H:%M:%S}] {text}"
+        self.log.appendPlainText(line)
+        if self._logfile is not None:
+            try:
+                self._logfile.write(line + "\n")
+                self._logfile.flush()
+            except Exception:  # noqa: BLE001
+                self._logfile = None
 
     def start(self):
         if not self.files:
@@ -541,6 +573,7 @@ def smoke_test() -> int:
 
 
 def main():
+    enable_crash_log()
     if "--smoke-test" in sys.argv:
         try:
             sys.exit(smoke_test())

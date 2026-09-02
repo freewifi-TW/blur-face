@@ -366,10 +366,10 @@ class HeadDetector:
 class UnionDetector:
     """聯集多個偵測器的結果（重疊框合併），追求最高召回率。
 
-    子偵測器是各自獨立的 onnxruntime session，detect() 用執行緒池「同時」送算——
-    session.run 與 cv2 前處理都會釋放 GIL，偵測時間從各模型相加變成最慢的那個。
-    DirectML 對不同 session 的並行送算一般沒問題；萬一環境不支援（送算拋例外），
-    會自動退回串行並在這個行程內沿用，結果不受影響。
+    子偵測器是各自獨立的 onnxruntime session。全部走 CPU 時 detect() 用執行緒池「同時」
+    送算（session.run 與 cv2 前處理都會釋放 GIL），偵測時間從各模型相加變成最慢的那個。
+    有任何 session 在 DirectML 上時一律串行：實測 DML 跨執行緒並行送算會在原生層卡死
+    甚至讓行程直接崩潰（存取違規，Python 攔不到），v1.3.0 因此閃退。
     """
 
     def __init__(self, detectors: list):
@@ -380,7 +380,10 @@ class UnionDetector:
             getattr(d, "det_size", None) or getattr(d, "INPUT", None) or getattr(d, "MAX_SIDE", 1280)
             for d in detectors
         )
-        self._pool = ThreadPoolExecutor(max_workers=len(detectors)) if len(detectors) > 1 else None
+        cpu_only = all(
+            getattr(d, "provider", "CPUExecutionProvider") == "CPUExecutionProvider" for d in detectors
+        )
+        self._pool = ThreadPoolExecutor(max_workers=len(detectors)) if len(detectors) > 1 and cpu_only else None
         self._parallel = self._pool is not None
 
     def detect(self, frame: np.ndarray) -> list[tuple[int, int, int, int]]:
