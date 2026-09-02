@@ -35,9 +35,35 @@ jobs:
       # PyInstaller 預編譯的 bootloader 被所有 PyInstaller 程式共用，早被防毒的 ML 模型學成「可疑特徵」，
       # 是 Windows Defender 誤報 Trojan:Win32/Wacatac.C!ml 的主因。
       # Windows 改從原始碼（sdist）編譯 bootloader，讓 exe 的 bootloader hash 與大家不同。runner 內建 MSVC 可直接編。
+      # 注意：sdist 裡其實也附了 Windows 預編譯 bootloader（給 MSYS2 使用者），單靠 --no-binary 不會重編，
+      # 必須設 PYINSTALLER_COMPILE_BOOTLOADER 強制 hatch_build.py 跑 waf。
       - name: Install PyInstaller (Windows, build bootloader from source)
         if: runner.os == 'Windows'
+        env:
+          PYINSTALLER_COMPILE_BOOTLOADER: "1"
         run: pip install --no-binary pyinstaller pyinstaller
+
+      # 自我檢查：裝好的 bootloader 必須與官方 wheel 裡的不同，否則上面的編譯其實沒發生
+      - name: Verify bootloader differs from official wheel (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          python - <<'EOF'
+          import hashlib, pathlib, subprocess, sys, zipfile
+          import PyInstaller
+          ver = PyInstaller.__version__
+          rel = "PyInstaller/bootloader/Windows-64bit-intel/runw.exe"
+          local = pathlib.Path(PyInstaller.__file__).parent / "bootloader/Windows-64bit-intel/runw.exe"
+          subprocess.run([sys.executable, "-m", "pip", "download", "-q", "--no-deps", "--only-binary", ":all:",
+                          f"pyinstaller=={ver}", "-d", "official_wheel"], check=True)
+          whl = next(pathlib.Path("official_wheel").glob("pyinstaller-*.whl"))
+          official = hashlib.sha256(zipfile.ZipFile(whl).read(rel)).hexdigest()
+          ours = hashlib.sha256(local.read_bytes()).hexdigest()
+          print(f"PyInstaller {ver}\n官方 wheel runw.exe : {official}\n本次編譯 runw.exe : {ours}")
+          if official == ours:
+              sys.exit("bootloader 與官方 wheel 相同，沒有真的從原始碼編譯！")
+          print("OK：bootloader 為本次自行編譯")
+          EOF
 
       - name: Install PyInstaller (macOS)
         if: runner.os == 'macOS'
