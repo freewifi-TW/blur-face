@@ -10,6 +10,7 @@
 import argparse
 import queue
 import shutil
+from concurrent.futures import ThreadPoolExecutor
 import subprocess
 import sys
 import tempfile
@@ -363,7 +364,13 @@ class HeadDetector:
 
 
 class UnionDetector:
-    """聯集多個偵測器的結果（重疊框合併），追求最高召回率。"""
+    """聯集多個偵測器的結果（重疊框合併），追求最高召回率。
+
+    子偵測器是各自獨立的 onnxruntime session，detect() 用執行緒池「同時」送算——
+    session.run 與 cv2 前處理都會釋放 GIL，偵測時間從各模型相加變成最慢的那個。
+    DirectML 對不同 session 的並行送算一般沒問題；萬一環境不支援（送算拋例外），
+    會自動退回串行並在這個行程內沿用，結果不受影響。
+    """
 
     def __init__(self, detectors: list):
         self.detectors = detectors
@@ -373,6 +380,8 @@ class UnionDetector:
             getattr(d, "det_size", None) or getattr(d, "INPUT", None) or getattr(d, "MAX_SIDE", 1280)
             for d in detectors
         )
+        self._pool = ThreadPoolExecutor(max_workers=len(detectors)) if len(detectors) > 1 else None
+        self._parallel = self._pool is not None
 
     def detect(self, frame: np.ndarray) -> list[tuple[int, int, int, int]]:
         h, w = frame.shape[:2]
@@ -380,7 +389,15 @@ class UnionDetector:
         src = frame
         if s < 1.0:
             src = cv2.resize(frame, (max(1, round(w * s)), max(1, round(h * s))), interpolation=cv2.INTER_AREA)
-        boxes = [b for d in self.detectors for b in d.detect(src)]
+        if self._parallel:
+            try:
+                results = list(self._pool.map(lambda d: d.detect(src), self.detectors))
+            except Exception:  # noqa: BLE001 — 環境不支援並行送算：退回串行並沿用
+                self._parallel = False
+                results = [d.detect(src) for d in self.detectors]
+        else:
+            results = [d.detect(src) for d in self.detectors]
+        boxes = [b for r in results for b in r]
         if s < 1.0:
             boxes = [tuple(int(v / s) for v in b) for b in boxes]
         if not boxes:
@@ -398,18 +415,26 @@ class RescueDetector:
     關節、物體易給出 0.3-0.6 的誤判（實測誤打碼全部來自它），且頭部偵測本就較耐旋轉，
     正著沒抓到的頭轉了也救不回多少，排除它可把補救誤框壓到 SCRFD 本身的水準。
     命中過的旋轉方向會排到最前、一中就停：連續橫躺片段每幀只多一次偵測，而非固定兩次。
+    兩個方向都落空時進入冷卻（跳過接下來 COOLDOWN 個觸發幀）：空景長片段的旋轉重跑成本
+    降到 1/3，追蹤補洞的內插與前後延伸會蓋住抽樣的空隙；一命中就恢復逐幀。
     """
 
     ROTATIONS = {90: cv2.ROTATE_90_CLOCKWISE, 270: cv2.ROTATE_90_COUNTERCLOCKWISE}
+    COOLDOWN = 2  # 落空後跳過的觸發幀數（每 3 幀試 1 次）
 
     def __init__(self, primary, rescue_parts: list | None = None):
         self.primary = primary
         parts = rescue_parts or [primary]
         self.rescue_det = parts[0] if len(parts) == 1 else UnionDetector(parts)
         self.order = list(self.ROTATIONS)  # 嘗試順序，最近命中的排前面
+        self._skip = 0            # 冷卻中剩餘要跳過的觸發幀數
         self.triggered = 0        # 主偵測沒抓到、啟用補救的幀數
         self.rescued_frames = 0   # 補救有抓到的幀數
         self.rescued_boxes = 0    # 補救抓到的框數
+
+    def reset(self):
+        """換檔案時歸零冷卻：照片彼此獨立、新影片開頭不該繼承上一支的冷卻狀態。"""
+        self._skip = 0
 
     @staticmethod
     def _unrotate(box, rot: int, h0: int, w0: int) -> tuple[int, int, int, int]:
@@ -428,6 +453,9 @@ class RescueDetector:
         if boxes:
             return boxes
         self.triggered += 1
+        if self._skip > 0:
+            self._skip -= 1
+            return []
         h0, w0 = frame.shape[:2]
         for rot in list(self.order):
             found = self.rescue_det.detect(cv2.rotate(frame, self.ROTATIONS[rot]))
@@ -437,6 +465,7 @@ class RescueDetector:
                 self.rescued_frames += 1
                 self.rescued_boxes += len(found)
                 return [self._unrotate(b, rot, h0, w0) for b in found]
+        self._skip = self.COOLDOWN
         return []
 
     def stats(self) -> tuple[int, int, int]:
@@ -446,6 +475,12 @@ class RescueDetector:
 def rescue_stats(detector) -> tuple[int, int, int] | None:
     """回傳補救統計 (觸發幀數, 救回幀數, 救回框數)；偵測器沒開補救時回傳 None。"""
     return detector.stats() if isinstance(detector, RescueDetector) else None
+
+
+def reset_rescue(detector):
+    """換檔案時重置補救冷卻；偵測器沒開補救時為 no-op。"""
+    if isinstance(detector, RescueDetector):
+        detector.reset()
 
 
 def create_detector(args, log=None):
@@ -534,10 +569,36 @@ def censor_region(frame, x1, y1, x2, y2, mode: str, strength: int, ellipse: bool
         frame[y1:y2, x1:x2] = censored
 
 
+def _merge_overlaps(rects: list) -> list:
+    """迭代合併高度重疊的矩形（交集 ÷ 較小面積 > 0.5）成外接矩形。
+
+    同一顆頭常同時有臉框＋頭框（IoU 不足 0.5，NMS 不會去重）、追蹤軌跡交接時
+    也會短暫有兩條軌跡各出一框；不合併就會重複打碼，馬賽克格子錯開、出現接縫。
+    兩個獨立但靠近的臉交集小，不會被合併。矩形為 (x1, y1, x2, y2)。
+    """
+    changed = True
+    while changed:
+        changed = False
+        out: list = []
+        for r in rects:
+            for i, o in enumerate(out):
+                iw = min(r[2], o[2]) - max(r[0], o[0])
+                ih = min(r[3], o[3]) - max(r[1], o[1])
+                smaller = min((r[2] - r[0]) * (r[3] - r[1]), (o[2] - o[0]) * (o[3] - o[1]))
+                if iw > 0 and ih > 0 and smaller > 0 and iw * ih > 0.5 * smaller:
+                    out[i] = (min(r[0], o[0]), min(r[1], o[1]), max(r[2], o[2]), max(r[3], o[3]))
+                    changed = True
+                    break
+            else:
+                out.append(r)
+        rects = out
+    return rects
+
+
 def apply_boxes(frame, boxes, args):
-    """把一組偵測框打碼到畫面上。"""
-    for box in boxes:
-        x1, y1, x2, y2 = expand_box(box, args.pad, frame.shape)
+    """把一組偵測框外擴、合併重疊後打碼到畫面上。"""
+    rects = [expand_box(box, args.pad, frame.shape) for box in boxes]
+    for x1, y1, x2, y2 in _merge_overlaps(rects):
         censor_region(frame, x1, y1, x2, y2, args.mode, args.strength, args.ellipse)
 
 
@@ -673,6 +734,7 @@ def process_image(path: Path, out_path: Path, detector, args, log=print):
     if img is None:
         log(f"⚠ 無法讀取圖片：{path}")
         return None
+    reset_rescue(detector)  # 照片彼此獨立，不繼承前一檔的補救冷卻
     t0 = time.time()
     before = rescue_stats(detector)
     n = process_frame(img, detector, args)
@@ -953,6 +1015,7 @@ def _process_video_once(path, out_path, detector, args, sink: str, ffmpeg, log, 
              "t_decode": 0.0, "t_detect": 0.0, "t_track": 0.0, "t_censor": 0.0,
              "t_tobytes": 0.0, "t_pipe": 0.0, "phase": None, "t_advance": time.time(),
              "last_boxes": 0, "max_boxes": 0, "last_max_side": 0}
+    reset_rescue(detector)  # 新影片不繼承上一檔的補救冷卻
     rescue_before = rescue_stats(detector)
     t_start = time.time()
 

@@ -330,6 +330,17 @@ class MainWindow(QMainWindow):
         )
         grid.addWidget(self.hw_encode, 4, 2)
 
+        self.pad = QSlider(Qt.Horizontal)
+        self.pad.setRange(0, 50)
+        self.pad.setValue(15)
+        self.pad_lbl = QLabel("15%")
+        self.pad.valueChanged.connect(lambda v: self.pad_lbl.setText(f"{v}%"))
+        add_field("遮蔽範圍", self.pad, 5, 0, (
+            "偵測框向外擴張的比例（0–50%，預設 15%）\n"
+            "調大：連髮際、下巴、頭髮邊緣都蓋住，遮蔽更保險\n"
+            "調小：貼著偵測框打碼，畫面遮擋最少"
+        ), extra=self.pad_lbl)
+
         self.out_btn = QPushButton("輸出資料夾：原檔旁（點擊變更）")
         self.out_btn.setToolTip(
             "處理結果的存放位置，原始檔案永遠不會被修改\n"
@@ -337,7 +348,7 @@ class MainWindow(QMainWindow):
             "點擊可改成統一輸出到你指定的資料夾"
         )
         self.out_btn.clicked.connect(self.pick_out_dir)
-        grid.addWidget(self.out_btn, 5, 0, 1, 5)
+        grid.addWidget(self.out_btn, 6, 0, 1, 5)
 
         layout.addWidget(opts)
 
@@ -430,7 +441,7 @@ class MainWindow(QMainWindow):
             detector=DETECTOR_CHOICES[self.detector.currentIndex()][1],
             det_size=int(self.det_size.currentText().split("（")[0]),
             conf=self.conf.value() / 100,
-            pad=0.15,
+            pad=self.pad.value() / 100,
             keep=4,
             ellipse=self.ellipse.isChecked(),
             head=self.head.isChecked(),
@@ -459,7 +470,7 @@ class MainWindow(QMainWindow):
             self.logged_env = True
         self.append_log(
             f"開始處理 {len(self.files)} 個檔案 · "
-            f"{'馬賽克' if args.mode == 'mosaic' else '高斯模糊'} 強度 {args.strength}"
+            f"{'馬賽克' if args.mode == 'mosaic' else '高斯模糊'} 強度 {args.strength} 外擴 {args.pad:.0%}"
             f"{'（橢圓遮罩）' if args.ellipse else ''} · 偵測器 {args.detector} · 解析度 {args.det_size} · "
             f"門檻 {args.conf:.2f} · 頭部 {('開 ' + format(args.head_conf, '.2f')) if args.head else '關'} · "
             f"追蹤 {'開' if args.track else '關'} · 補救 {'開' if args.rescue else '關'} · "
@@ -507,7 +518,7 @@ class MainWindow(QMainWindow):
     def set_busy(self, busy: bool):
         self.start_btn.setEnabled(not busy)
         self.cancel_btn.setEnabled(busy)
-        for w in (self.mode, self.strength, self.detector, self.det_size, self.conf,
+        for w in (self.mode, self.strength, self.detector, self.det_size, self.conf, self.pad,
                   self.ellipse, self.head, self.track, self.rescue, self.gpu, self.hw_encode, self.out_btn):
             w.setEnabled(not busy)
         self.head_conf.setEnabled(not busy and self.head.isChecked())
