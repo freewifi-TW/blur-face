@@ -18,6 +18,7 @@ import threading
 import time
 from collections import deque
 from pathlib import Path
+from typing import NamedTuple
 
 import cv2
 import numpy as np
@@ -238,17 +239,80 @@ def device_label(detector) -> str:
 # 偵測器
 # ---------------------------------------------------------------------------
 
-class ScrfdDetector:
+Box = tuple[int, int, int, int]  # (x, y, w, h)
+
+
+class Detection(NamedTuple):
+    """一個偵測框與其分數。strong：分數達到該偵測器的正式門檻（conf）。
+
+    偵測器另以較低的追蹤門檻（track_conf）保留「弱框」（strong=False）：單獨出現時不打碼，
+    只用來延續影片中已經確立的軌跡——頭低到只剩頭頂、極端角度時模型分數會掉到 0.2-0.3，
+    有前後幀的高分軌跡作保，這些弱框就能接住原本會漏掉的幀。
+    """
+
+    box: Box
+    score: float
+    strong: bool
+
+
+def _merge_scored(dets: list[Detection]) -> list[Detection]:
+    """合併高度重疊的偵測框（交集 ÷ 較小面積 > 0.5 → 外接矩形，分數取大）；強框與弱框重疊時
+    只保留強框的矩形（弱框可能是紋理誤判，不讓它撐大遮蔽範圍）。
+
+    臉框幾乎整個落在頭框內，但兩者 IoU 常在 0.4-0.6 徘徊：用 IoU 0.5 的 NMS 去重會在
+    「兩框都留（再被合併成大框）」和「頭框被壓掉（只剩臉框）」之間逐幀跳動，這就是開頭部偵測
+    後頭一動打碼區域忽大忽小的根因。改成包含關係判定後，同一顆頭永遠合成同一個外接框。
+    """
+    rects = [(d.box[0], d.box[1], d.box[0] + d.box[2], d.box[1] + d.box[3], d.score, d.strong) for d in dets]
+    changed = True
+    while changed:
+        changed = False
+        out: list = []
+        for r in rects:
+            for i, o in enumerate(out):
+                iw = min(r[2], o[2]) - max(r[0], o[0])
+                ih = min(r[3], o[3]) - max(r[1], o[1])
+                smaller = min((r[2] - r[0]) * (r[3] - r[1]), (o[2] - o[0]) * (o[3] - o[1]))
+                if iw > 0 and ih > 0 and smaller > 0 and iw * ih > 0.5 * smaller:
+                    if r[5] != o[5]:
+                        # 強框吸收弱框：保留強框的矩形，弱框不得撐大遮蔽範圍
+                        keep = r if r[5] else o
+                        out[i] = (*keep[:4], max(r[4], o[4]), True)
+                    else:
+                        out[i] = (min(r[0], o[0]), min(r[1], o[1]), max(r[2], o[2]), max(r[3], o[3]),
+                                  max(r[4], o[4]), r[5])
+                    changed = True
+                    break
+            else:
+                out.append(r)
+        rects = out
+    return [Detection((x1, y1, x2 - x1, y2 - y1), s, st) for x1, y1, x2, y2, s, st in rects]
+
+
+class _ScoredDetector:
+    """共用介面：子類實作 detect_scored()，detect() 只回傳達到正式門檻的框。"""
+
+    conf: float
+
+    def detect_scored(self, frame: np.ndarray) -> list[Detection]:
+        raise NotImplementedError
+
+    def detect(self, frame: np.ndarray) -> list[Box]:
+        return [d.box for d in self.detect_scored(frame) if d.strong]
+
+
+class ScrfdDetector(_ScoredDetector):
     """SCRFD-10G 偵測器（onnxruntime），高召回率，對側臉/小臉/遮擋臉表現好。"""
 
     STRIDES = (8, 16, 32)
     NUM_ANCHORS = 2
     NMS_IOU = 0.4
 
-    def __init__(self, conf: float, det_size: int, device: str = "auto", log=None):
+    def __init__(self, conf: float, det_size: int, device: str = "auto", log=None, track_conf: float | None = None):
         if not SCRFD_MODEL.exists():
             sys.exit(f"找不到模型檔 {SCRFD_MODEL}，請先下載（見 README.md）")
         self.conf = conf
+        self.floor = min(conf, track_conf) if track_conf is not None else conf  # 弱框保留下限
         self.det_size = max(64, (det_size + 31) // 32 * 32)  # 需為 32 的倍數
         self.session, self.provider = create_session(
             SCRFD_MODEL, device, (1, 3, self.det_size, self.det_size), log
@@ -265,7 +329,7 @@ class ScrfdDetector:
             self._anchor_cache[stride] = np.repeat(centers.reshape(-1, 2), self.NUM_ANCHORS, axis=0)
         return self._anchor_cache[stride]
 
-    def detect(self, frame: np.ndarray) -> list[tuple[int, int, int, int]]:
+    def detect_scored(self, frame: np.ndarray) -> list[Detection]:
         h, w = frame.shape[:2]
         # 等比例縮放到 det_size x det_size 畫布（右/下留黑邊）
         scale = min(self.det_size / h, self.det_size / w)
@@ -281,7 +345,7 @@ class ScrfdDetector:
         all_boxes, all_scores = [], []
         for idx, stride in enumerate(self.STRIDES):
             scores = outs[idx].flatten()
-            keep = scores >= self.conf
+            keep = scores >= self.floor
             if not keep.any():
                 continue
             centers = self._anchors(stride)[keep]
@@ -296,24 +360,28 @@ class ScrfdDetector:
 
         if not all_boxes:
             return []
-        idxs = cv2.dnn.NMSBoxes(all_boxes, all_scores, self.conf, self.NMS_IOU)
-        return [tuple(int(v) for v in all_boxes[i]) for i in np.array(idxs).flatten()]
+        # NMS 只會用高分框壓掉低分框，所以弱框的存在不改變達門檻框的結果
+        idxs = cv2.dnn.NMSBoxes(all_boxes, all_scores, self.floor, self.NMS_IOU)
+        return [Detection(tuple(int(v) for v in all_boxes[i]), all_scores[i], all_scores[i] >= self.conf)
+                for i in np.array(idxs).flatten()]
 
 
-class YunetDetector:
+class YunetDetector(_ScoredDetector):
     """YuNet 偵測器（OpenCV 內建 DNN，只能跑 CPU），輕量快速。"""
 
     MAX_SIDE = 1280  # 偵測時長邊縮到此尺寸以內
     provider = "CPUExecutionProvider"
 
-    def __init__(self, conf: float):
+    def __init__(self, conf: float, track_conf: float | None = None):
         if not YUNET_MODEL.exists():
             sys.exit(f"找不到模型檔 {YUNET_MODEL}，請先下載（見 README.md）")
+        self.conf = conf
+        self.floor = min(conf, track_conf) if track_conf is not None else conf
         self.detector = cv2.FaceDetectorYN.create(
-            str(YUNET_MODEL), "", (320, 320), score_threshold=conf, nms_threshold=0.3, top_k=5000
+            str(YUNET_MODEL), "", (320, 320), score_threshold=self.floor, nms_threshold=0.3, top_k=5000
         )
 
-    def detect(self, frame: np.ndarray) -> list[tuple[int, int, int, int]]:
+    def detect_scored(self, frame: np.ndarray) -> list[Detection]:
         h, w = frame.shape[:2]
         scale = 1.0
         det_input = frame
@@ -325,28 +393,41 @@ class YunetDetector:
         _, faces = self.detector.detect(det_input)
         if faces is None:
             return []
-        return [tuple((face[:4] / scale).astype(int)) for face in faces]
+        # 每列 15 個值：x, y, w, h, 5 個關鍵點 (x, y)，最後一個是分數
+        return [Detection(tuple((face[:4] / scale).astype(int)), float(face[14]), float(face[14]) >= self.conf)
+                for face in faces]
 
 
-class HeadDetector:
-    """YOLOv5m（CrowdHuman 頭部類別）偵測器：抓「整顆頭」，背對鏡頭、極端角度也偵測得到。"""
+class HeadDetector(_ScoredDetector):
+    """YOLOv5m（CrowdHuman 頭部類別）偵測器：抓「整顆頭」，背對鏡頭、極端角度也偵測得到。
+
+    縮小重掃（ZOOM_OUT）：CrowdHuman 的頭多在幾十到一百多像素，特寫時整顆頭佔滿大半個 640 畫布
+    就超出模型見過的尺度——低頭到只剩頭頂的畫面實測原尺度只有 0.1-0.2 分，把畫面縮到 1/3 置中
+    再掃卻有 0.24-0.52。所以整幀沒有達門檻頭框、而且追蹤需要弱框時，多掃一次縮小版；其結果一律
+    視為弱框（只延續既有軌跡、不開新框），避免縮小後的軀幹、圓弧物體被當成頭而新增誤打碼。
+    """
 
     INPUT = 640
     NMS_IOU = 0.45
+    ZOOM_OUT = 3.0
 
-    def __init__(self, conf: float, device: str = "auto", log=None):
+    def __init__(self, conf: float, device: str = "auto", log=None, track_conf: float | None = None):
         if not HEAD_MODEL.exists():
             sys.exit(f"找不到模型檔 {HEAD_MODEL}，請先下載（見 README.md）")
         self.session, self.provider = create_session(HEAD_MODEL, device, (1, 3, self.INPUT, self.INPUT), log)
         self.input_name = self.session.get_inputs()[0].name
         self.conf = conf
+        self.floor = min(conf, track_conf) if track_conf is not None else conf
 
-    def detect(self, frame: np.ndarray) -> list[tuple[int, int, int, int]]:
+    def _run(self, frame: np.ndarray, zoom: float = 1.0) -> list[Detection]:
+        """跑一次推論。zoom=1 時畫面靠左上貼滿畫布；zoom>1 時縮成 1/zoom 置中（四周灰底）。"""
         h, w = frame.shape[:2]
-        scale = min(self.INPUT / h, self.INPUT / w)
-        nh, nw = int(h * scale), int(w * scale)
+        scale = min(self.INPUT / h, self.INPUT / w) / zoom
+        nh, nw = max(1, int(h * scale)), max(1, int(w * scale))
+        oy, ox = ((self.INPUT - nh) // 2, (self.INPUT - nw) // 2) if zoom > 1 else (0, 0)
         canvas = np.full((self.INPUT, self.INPUT, 3), 114, dtype=np.uint8)
-        canvas[:nh, :nw] = cv2.resize(frame, (nw, nh))
+        canvas[oy:oy + nh, ox:ox + nw] = cv2.resize(
+            frame, (nw, nh), interpolation=cv2.INTER_AREA if zoom > 1 else cv2.INTER_LINEAR)
         blob = np.ascontiguousarray(
             canvas[:, :, ::-1].transpose(2, 0, 1)[None], dtype=np.float32
         ) / 255.0
@@ -354,22 +435,35 @@ class HeadDetector:
         # 輸出 (25200, 7)：cx, cy, w, h, objectness, person 分數, head 分數
         out = self.session.run(None, {self.input_name: blob})[0][0]
         scores = out[:, 4] * out[:, 6]  # 只取 head 類別
-        keep = scores >= self.conf
+        keep = scores >= self.floor
         if not keep.any():
             return []
-        cx, cy, bw, bh = out[keep, 0], out[keep, 1], out[keep, 2], out[keep, 3]
+        cx, cy, bw, bh = out[keep, 0] - ox, out[keep, 1] - oy, out[keep, 2], out[keep, 3]
         boxes = np.stack([cx - bw / 2, cy - bh / 2, bw, bh], axis=1) / scale
-        idxs = cv2.dnn.NMSBoxes(boxes.tolist(), scores[keep].tolist(), self.conf, self.NMS_IOU)
-        return [tuple(int(v) for v in boxes[i]) for i in np.array(idxs).flatten()]
+        kept_scores = scores[keep].tolist()
+        idxs = cv2.dnn.NMSBoxes(boxes.tolist(), kept_scores, self.floor, self.NMS_IOU)
+        return [Detection(tuple(int(v) for v in boxes[i]), kept_scores[i], kept_scores[i] >= self.conf)
+                for i in np.array(idxs).flatten()]
+
+    def detect_scored(self, frame: np.ndarray) -> list[Detection]:
+        dets = self._run(frame)
+        if self.floor < self.conf and not any(d.strong for d in dets):
+            extra = [Detection(d.box, d.score, False) for d in self._run(frame, self.ZOOM_OUT)]
+            if extra:
+                dets = _merge_scored(dets + extra)
+        return dets
 
 
-class UnionDetector:
+class UnionDetector(_ScoredDetector):
     """聯集多個偵測器的結果（重疊框合併），追求最高召回率。
 
     子偵測器是各自獨立的 onnxruntime session。全部走 CPU 時 detect() 用執行緒池「同時」
     送算（session.run 與 cv2 前處理都會釋放 GIL），偵測時間從各模型相加變成最慢的那個。
     有任何 session 在 DirectML 上時一律串行：實測 DML 跨執行緒並行送算會在原生層卡死
     甚至讓行程直接崩潰（存取違規，Python 攔不到），v1.3.0 因此閃退。
+
+    重疊框以「包含關係」合併（見 _merge_scored）而非 IoU NMS：臉框＋頭框永遠合成同一個
+    外接框，不會隨 IoU 在 0.5 上下徘徊而逐幀在臉框／大框之間跳動。
     """
 
     def __init__(self, detectors: list):
@@ -386,7 +480,7 @@ class UnionDetector:
         self._pool = ThreadPoolExecutor(max_workers=len(detectors)) if len(detectors) > 1 and cpu_only else None
         self._parallel = self._pool is not None
 
-    def detect(self, frame: np.ndarray) -> list[tuple[int, int, int, int]]:
+    def detect_scored(self, frame: np.ndarray) -> list[Detection]:
         h, w = frame.shape[:2]
         s = min(1.0, self.max_side / max(h, w))
         src = frame
@@ -394,23 +488,19 @@ class UnionDetector:
             src = cv2.resize(frame, (max(1, round(w * s)), max(1, round(h * s))), interpolation=cv2.INTER_AREA)
         if self._parallel:
             try:
-                results = list(self._pool.map(lambda d: d.detect(src), self.detectors))
+                results = list(self._pool.map(lambda d: d.detect_scored(src), self.detectors))
             except Exception:  # noqa: BLE001 — 環境不支援並行送算：退回串行並沿用
                 self._parallel = False
-                results = [d.detect(src) for d in self.detectors]
+                results = [d.detect_scored(src) for d in self.detectors]
         else:
-            results = [d.detect(src) for d in self.detectors]
-        boxes = [b for r in results for b in r]
+            results = [d.detect_scored(src) for d in self.detectors]
+        dets = [d for r in results for d in r]
         if s < 1.0:
-            boxes = [tuple(int(v / s) for v in b) for b in boxes]
-        if not boxes:
-            return []
-        # 用 NMS 去除高度重疊的重複框，分數一律 1.0（只做去重）
-        idxs = cv2.dnn.NMSBoxes([list(map(float, b)) for b in boxes], [1.0] * len(boxes), 0.0, 0.5)
-        return [boxes[i] for i in np.array(idxs).flatten()]
+            dets = [Detection(tuple(int(v / s) for v in d.box), d.score, d.strong) for d in dets]
+        return _merge_scored(dets) if dets else []
 
 
-class RescueDetector:
+class RescueDetector(_ScoredDetector):
     """旋轉補救：主偵測器整幀沒抓到臉時，把畫面轉 90 / 270 度再用臉部模型重跑。
 
     專救橫躺、大角度歪斜的臉——SCRFD 對平面內旋轉約 ±30 度內穩定，躺姿、畫面橫著拍就會漏。
@@ -451,25 +541,27 @@ class RescueDetector:
         xs, ys = [c[0] for c in corners], [c[1] for c in corners]
         return int(min(xs)), int(min(ys)), int(max(xs) - min(xs)), int(max(ys) - min(ys))
 
-    def detect(self, frame: np.ndarray) -> list[tuple[int, int, int, int]]:
-        boxes = self.primary.detect(frame)
-        if boxes:
-            return boxes
+    def detect_scored(self, frame: np.ndarray) -> list[Detection]:
+        dets = self.primary.detect_scored(frame)
+        if any(d.strong for d in dets):
+            return dets
+        # 主偵測只剩弱框（或全空）才補救；弱框一併保留給追蹤延續用
         self.triggered += 1
         if self._skip > 0:
             self._skip -= 1
-            return []
+            return dets
         h0, w0 = frame.shape[:2]
         for rot in list(self.order):
-            found = self.rescue_det.detect(cv2.rotate(frame, self.ROTATIONS[rot]))
-            if found:
+            found = self.rescue_det.detect_scored(cv2.rotate(frame, self.ROTATIONS[rot]))
+            strong = [d for d in found if d.strong]
+            if strong:
                 self.order.remove(rot)
                 self.order.insert(0, rot)
                 self.rescued_frames += 1
-                self.rescued_boxes += len(found)
-                return [self._unrotate(b, rot, h0, w0) for b in found]
+                self.rescued_boxes += len(strong)
+                return dets + [Detection(self._unrotate(d.box, rot, h0, w0), d.score, d.strong) for d in found]
         self._skip = self.COOLDOWN
-        return []
+        return dets
 
     def stats(self) -> tuple[int, int, int]:
         return self.triggered, self.rescued_frames, self.rescued_boxes
@@ -497,20 +589,23 @@ def create_detector(args, log=None):
     - args.rescue（預設關）：整幀沒抓到臉時，把畫面轉 90/270 度用「臉部模型」再跑一次（旋轉補救），
       不含頭部模型——頭部模型對旋轉畫面的圓弧皮膚/物體易誤判，且頭部偵測本就耐旋轉。
       救回橫躺、大角度歪斜的臉，誤框率為 SCRFD 本身的水準。
+    - args.track_conf（預設 0.15）：追蹤延續門檻。各模型會把分數在此之上、未達正式門檻的「弱框」
+      也回傳（Detection.strong=False），只供 StreamTracker 延續既有軌跡，單獨不打碼。
     """
     device = getattr(args, "device", "auto")
+    track_conf = getattr(args, "track_conf", 0.15) if getattr(args, "track", True) else None
     parts = []
     if args.detector in ("scrfd", "both"):
-        parts.append(ScrfdDetector(args.conf, args.det_size, device, log))
+        parts.append(ScrfdDetector(args.conf, args.det_size, device, log, track_conf))
         if getattr(args, "multiscale", True) and parts[-1].det_size > 640:
-            parts.append(ScrfdDetector(args.conf, 640, device, log))
+            parts.append(ScrfdDetector(args.conf, 640, device, log, track_conf))
     if args.detector in ("yunet", "both"):
-        parts.append(YunetDetector(args.conf))
+        parts.append(YunetDetector(args.conf, track_conf))
         if log and device != "cpu" and args.detector == "yunet":
             log("YuNet 走 OpenCV DNN，只能用 CPU")
     face_parts = list(parts)  # 旋轉補救只重跑臉部模型（不含頭部），共用同一批 session
     if getattr(args, "head", False):
-        parts.append(HeadDetector(getattr(args, "head_conf", 0.5), device, log))
+        parts.append(HeadDetector(getattr(args, "head_conf", 0.5), device, log, track_conf))
     det = parts[0] if len(parts) == 1 else UnionDetector(parts)
     if getattr(args, "rescue", False):
         det = RescueDetector(det, face_parts)
@@ -645,37 +740,49 @@ class StreamTracker:
     軌跡起點往前、終點往後各延伸 extend 幀。結果與「全片偵測完再回頭補洞」的離線做法完全相同，
     但只需暫存 delay 幀畫面，影片只要解碼一遍。
 
-    min_hits：一條軌跡至少要被偵測到幾幀才輸出（預設 2）。只出現一幀的框幾乎都是誤判（圓弧物體、
-    紋理），而追蹤補洞會把它往前後各延伸 extend 幀、放大成 13 幀的馬賽克塊；真臉幾乎每幀都會被
-    偵測到，不受影響。
+    min_hits：一條軌跡至少要被「達門檻」偵測到幾幀才輸出（預設 2）。只出現一幀的框幾乎都是誤判
+    （圓弧物體、紋理），而追蹤補洞會把它往前後各延伸 extend 幀、放大成 13 幀的馬賽克塊；真臉幾乎
+    每幀都會被偵測到，不受影響。
+
+    兩段式配對（弱框延續）：偵測結果可含分數未達正式門檻的弱框（Detection.strong=False）。先用達門檻
+    的框配對既有軌跡，沒配到的軌跡再用弱框接續；弱框不能開新軌跡、也不計入 hits。頭低到只剩頭頂、
+    轉到極端角度時模型分數會掉到 0.2-0.3 而漏幀，靠前後幀的高分軌跡作保就能接住，而弱框單獨出現時
+    （紋理、圓弧物體）不會產生任何打碼。
+
+    尺寸平滑（smooth）：輸出時每個框的寬高取同一軌跡前後 ±smooth 幀偵測框的最大值、中心沿用當幀。
+    臉框／頭框在某些幀只剩其一、YOLO 框逐幀抖動，都會讓打碼區域忽大忽小；遮蔽寧大勿小，取窗內最大
+    尺寸就穩定了。輸出已延遲 delay 幀，往後看 smooth 幀不需額外緩衝。
     """
 
-    def __init__(self, iou_thresh: float = 0.3, max_gap: int = 15, extend: int = 6, min_hits: int = 2):
+    def __init__(self, iou_thresh: float = 0.3, max_gap: int = 15, extend: int = 6, min_hits: int = 2,
+                 smooth: int = 6):
         self.iou_thresh = iou_thresh
         self.max_gap = max_gap
         self.extend = extend
         self.min_hits = max(1, min_hits)
+        self.smooth = max(0, smooth)
         # 內插最多回頭改 max_gap-1 幀、起點延伸最多回頭 extend 幀；一條軌跡要等 max_gap 幀沒續接
         # 才能確定結束（終點延伸），所以延遲 max_gap+1 幀後該幀的框就全部確定了。
         # 有最少命中數要求時，起點往前延伸到幀 e 的軌跡最晚在 e+extend 才首次出現、再 max_gap 幀
         # 才知道有沒有第二次偵測，所以要多等 extend 幀。
         self.delay = max_gap + 1 + (extend if self.min_hits > 1 else 0)
-        self.tracks: list[dict] = []        # {"boxes": {幀號: box}, "last": 最後偵測到的幀號, "hits": 偵測次數}
+        # 軌跡：{"boxes": {幀號: box}（偵測到的幀，含弱框，幀號遞增插入）, "last": 最後偵測到的幀號,
+        #        "hits": 達門檻的偵測次數}
+        self.tracks: list[dict] = []
         self.pending: deque = deque()       # 尚未輸出的 (幀號, 畫面)
         self.boxes: dict[int, list] = {}    # 幀號 -> [(軌跡, 框)]（偵測 + 內插 + 起點延伸），輸出時依 hits 過濾
         self.idx = 0
 
-    def push(self, frame: np.ndarray, detections: list) -> list[tuple[np.ndarray, list]]:
-        """送入一幀與其偵測框，回傳此時已確定、可輸出的 [(畫面, 遮蔽框), ...]。"""
-        idx = self.idx
-        self.idx += 1
-        self.pending.append((idx, frame))
-        frame_boxes = self.boxes.setdefault(idx, [])
+    @staticmethod
+    def _as_dets(detections: list) -> list[Detection]:
+        """相容舊呼叫：純 box 視為達門檻的偵測。"""
+        return [d if isinstance(d, Detection) else Detection(tuple(d), 1.0, True) for d in detections]
 
-        active = [t for t in self.tracks if idx - t["last"] <= self.max_gap]
+    def _match(self, idx: int, active: list, cands: list, frame_boxes: list, strong: bool):
+        """把候選框貪婪地（IoU 由大到小）配給軌跡；回傳配到的軌跡集合。"""
         pairs = sorted(
-            ((_iou(t["boxes"][t["last"]], b), ti, bi)
-             for ti, t in enumerate(active) for bi, b in enumerate(detections)),
+            ((_iou(t["boxes"][t["last"]], d.box), ti, bi)
+             for ti, t in enumerate(active) for bi, d in enumerate(cands)),
             reverse=True,
         )
         used_t, used_b = set(), set()
@@ -684,7 +791,7 @@ class StreamTracker:
                 break
             if ti in used_t or bi in used_b:
                 continue
-            t, box = active[ti], detections[bi]
+            t, box = active[ti], cands[bi].box
             a, box_a = t["last"], t["boxes"][t["last"]]
             for i in range(a + 1, idx):  # 漏偵測的幀：線性內插
                 w = (i - a) / (idx - a)
@@ -693,37 +800,77 @@ class StreamTracker:
                 )))
             t["boxes"][idx] = box
             t["last"] = idx
-            t["hits"] += 1
+            if strong:
+                t["hits"] += 1
             frame_boxes.append((t, box))
             used_t.add(ti)
             used_b.add(bi)
-        for bi, box in enumerate(detections):
+        return {id(active[ti]) for ti in used_t}, used_b
+
+    def push(self, frame: np.ndarray, detections: list) -> list[tuple[np.ndarray, list]]:
+        """送入一幀與其偵測（Detection 或純 box），回傳此時已確定、可輸出的 [(畫面, 遮蔽框), ...]。"""
+        idx = self.idx
+        self.idx += 1
+        self.pending.append((idx, frame))
+        frame_boxes = self.boxes.setdefault(idx, [])
+        dets = self._as_dets(detections)
+        strong = [d for d in dets if d.strong]
+        weak = [d for d in dets if not d.strong]
+
+        active = [t for t in self.tracks if idx - t["last"] <= self.max_gap]
+        matched, used_b = self._match(idx, active, strong, frame_boxes, strong=True)
+        if weak:  # 第二段：沒被達門檻框接上的軌跡，用弱框延續
+            rest = [t for t in active if id(t) not in matched]
+            self._match(idx, rest, weak, frame_boxes, strong=False)
+        for bi, d in enumerate(strong):  # 只有達門檻的框能開新軌跡
             if bi in used_b:
                 continue
-            t = {"boxes": {idx: box}, "last": idx, "hits": 1}
+            t = {"boxes": {idx: d.box}, "last": idx, "hits": 1}
             self.tracks.append(t)
-            frame_boxes.append((t, box))
+            frame_boxes.append((t, d.box))
             for i in range(max(0, idx - self.extend), idx):  # 軌跡起點往前延伸
-                self.boxes[i].append((t, box))
+                self.boxes[i].append((t, d.box))
 
         out = self._emit(idx - self.delay)
         # 已結束且終點延伸也輸出完的軌跡可以丟掉
         self.tracks = [t for t in self.tracks if idx - t["last"] <= self.delay + self.extend]
+        # 已輸出且平滑窗也用不到的舊偵測框釋放掉，長軌跡的字典才不會無限長大（保留 last）
+        cutoff = idx - self.delay - self.smooth
+        for t in self.tracks:
+            bx = t["boxes"]
+            while len(bx) > 1:
+                k = next(iter(bx))
+                if k >= cutoff:
+                    break
+                del bx[k]
         return out
 
     def flush(self) -> list[tuple[np.ndarray, list]]:
         """影片結束：輸出所有還在緩衝的畫面。"""
         return self._emit(self.idx - 1)
 
+    def _smoothed(self, t: dict, e: int, box) -> tuple:
+        """框寬高取軌跡在 e ± smooth 幀內偵測框的最大值，中心沿用 box。"""
+        if self.smooth <= 0:
+            return box
+        bw, bh = box[2], box[3]
+        for f, b in t["boxes"].items():
+            if abs(f - e) <= self.smooth:
+                bw, bh = max(bw, b[2]), max(bh, b[3])
+        if bw == box[2] and bh == box[3]:
+            return box
+        cx, cy = box[0] + box[2] / 2, box[1] + box[3] / 2
+        return int(round(cx - bw / 2)), int(round(cy - bh / 2)), bw, bh
+
     def _emit(self, upto: int) -> list[tuple[np.ndarray, list]]:
         out = []
         while self.pending and self.pending[0][0] <= upto:
             e, frame = self.pending.popleft()
-            boxes = [b for t, b in self.boxes.pop(e, []) if t["hits"] >= self.min_hits]
+            boxes = [self._smoothed(t, e, b) for t, b in self.boxes.pop(e, []) if t["hits"] >= self.min_hits]
             for t in self.tracks:  # 已結束軌跡的終點往後延伸
                 a = t["last"]
                 if a < e <= a + self.extend and t["hits"] >= self.min_hits:
-                    boxes.append(t["boxes"][a])
+                    boxes.append(self._smoothed(t, e, t["boxes"][a]))
             out.append((frame, boxes))
         return out
 
@@ -732,8 +879,23 @@ class StreamTracker:
 # 照片
 # ---------------------------------------------------------------------------
 
+def _imread(path: Path):
+    """cv2.imread 在 Windows 上讀不到含中文等非 ASCII 字元的路徑（回傳 None），改用 imdecode。"""
+    try:
+        return cv2.imdecode(np.fromfile(str(path), dtype=np.uint8), cv2.IMREAD_COLOR)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _imwrite(path: Path, img: np.ndarray) -> bool:
+    ok, buf = cv2.imencode(path.suffix or ".png", img)
+    if ok:
+        buf.tofile(str(path))
+    return bool(ok)
+
+
 def process_image(path: Path, out_path: Path, detector, args, log=print):
-    img = cv2.imread(str(path))
+    img = _imread(path)
     if img is None:
         log(f"⚠ 無法讀取圖片：{path}")
         return None
@@ -741,7 +903,9 @@ def process_image(path: Path, out_path: Path, detector, args, log=print):
     t0 = time.time()
     before = rescue_stats(detector)
     n = process_frame(img, detector, args)
-    cv2.imwrite(str(out_path), img)
+    if not _imwrite(out_path, img):
+        log(f"⚠ 無法寫出圖片：{out_path}")
+        return None
     after = rescue_stats(detector)
     note = "，旋轉補救" if before and after and after[1] > before[1] else ""
     log(f"✓ {path.name} → {out_path.name}（{img.shape[1]}x{img.shape[0]}，偵測到 {n} 張人臉{note}，{time.time() - t0:.2f}s）")
@@ -1081,7 +1245,8 @@ def _process_video_once(path, out_path, detector, args, sink: str, ffmpeg, log, 
 
     def detect_loop():
         """跑在呼叫者執行緒：偵測器與建立它的執行緒相同，GUI 跨輪沿用行為不變。"""
-        tracker = StreamTracker(min_hits=getattr(args, "min_hits", 2)) if getattr(args, "track", True) else None
+        tracker = (StreamTracker(min_hits=getattr(args, "min_hits", 2), smooth=getattr(args, "smooth", 6))
+                   if getattr(args, "track", True) else None)
         sticky: list = []
         try:
             while True:
@@ -1089,12 +1254,16 @@ def _process_video_once(path, out_path, detector, args, sink: str, ffmpeg, log, 
                 if frame is None:
                     break
                 t0 = time.time()
-                boxes = detector.detect(frame)
+                if tracker is not None:
+                    dets = detector.detect_scored(frame)  # 含弱框，供軌跡延續
+                    boxes = [d.box for d in dets if d.strong]
+                else:
+                    boxes = detector.detect(frame)
                 stats["t_detect"] += time.time() - t0
                 stats["faces"] += len(boxes)
                 if tracker is not None:
                     t0 = time.time()
-                    emitted = tracker.push(frame, boxes)
+                    emitted = tracker.push(frame, dets)
                     stats["t_track"] += time.time() - t0
                 else:
                     # 逐幀模式：偵測框延續 keep 幀補空窗（原 process_frame 的 sticky 邏輯）
@@ -1278,6 +1447,11 @@ def main():
                         help="停用影片追蹤補洞，改回逐幀即時處理")
     parser.add_argument("--min-hits", type=int, default=2,
                         help="影片中一條軌跡至少要被偵測到幾幀才輸出；只出現一幀的框多為誤判，設 1 停用過濾")
+    parser.add_argument("--track-conf", type=float, default=0.15,
+                        help="追蹤延續門檻：分數在此之上、未達 --conf/--head-conf 的弱框只用來延續既有軌跡"
+                             "（頭低到只剩頭頂、極端角度時接住漏幀），單獨出現不打碼；設成與 --conf 相同即停用")
+    parser.add_argument("--smooth", type=int, default=6,
+                        help="追蹤框尺寸平滑：寬高取前後 N 幀偵測框的最大值，消除臉框／頭框交替造成的忽大忽小；0 停用")
     parser.add_argument("--no-multiscale", dest="multiscale", action="store_false",
                         help="停用多尺度：預設 det-size 高於 640 時會再加一道 640 掃描取聯集，補特寫大臉")
     parser.add_argument("--rescue", action="store_true",

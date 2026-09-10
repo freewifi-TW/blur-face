@@ -473,6 +473,8 @@ class MainWindow(QMainWindow):
             head_conf=self.head_conf.value() / 100,
             track=self.track.isChecked(),
             min_hits=2,
+            track_conf=0.15,  # 弱框延續門檻（只延續既有軌跡，不開新框）
+            smooth=6,         # 追蹤框尺寸平滑窗（前後幀取最大）
             device="auto" if self.gpu.isChecked() else "cpu",
             encoder="auto" if self.hw_encode.isChecked() else "software",
             multiscale=True,
@@ -505,10 +507,13 @@ class MainWindow(QMainWindow):
             f"{'馬賽克' if args.mode == 'mosaic' else '高斯模糊'} 強度 {args.strength} 外擴 {args.pad:.0%}"
             f"{'（橢圓遮罩）' if args.ellipse else ''} · 偵測器 {args.detector} · 解析度 {args.det_size} · "
             f"門檻 {args.conf:.2f} · 頭部 {('開 ' + format(args.head_conf, '.2f')) if args.head else '關'} · "
-            f"追蹤 {'開' if args.track else '關'} · 補救 {'開' if args.rescue else '關'} · "
+            f"追蹤 {('開（延續門檻 ' + format(args.track_conf, '.2f') + '、平滑 ±' + str(args.smooth) + ' 幀）') if args.track else '關'} · "
+            f"補救 {'開' if args.rescue else '關'} · "
             f"裝置 {args.device} · 編碼 {args.encoder} · 輸出 {self.out_dir or '原檔旁'}"
         )
-        key = (args.detector, args.det_size, args.conf, args.head, args.head_conf, args.device, args.rescue)
+        # 追蹤開關也在 key 裡：關追蹤時偵測器不保留弱框（create_detector 依 args.track 決定 track_conf）
+        key = (args.detector, args.det_size, args.conf, args.head, args.head_conf, args.device, args.rescue,
+               args.track, args.track_conf)
         if key != self.detector_key:
             if self.cached_detector is not None:
                 self.append_log("偵測設定已變更，釋放舊偵測器後重建")
