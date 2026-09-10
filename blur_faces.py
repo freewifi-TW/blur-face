@@ -706,16 +706,34 @@ def expand_box(box, pad: float, frame_shape) -> tuple[int, int, int, int]:
     return x1, y1, x2, y2
 
 
+def mosaic_block(x1, y1, x2, y2, strength: int) -> int:
+    """馬賽克格子邊長（像素）：短邊 ÷ 格數，再取不大於它的 2 的冪（最小 4）。
+
+    格子邊長若直接跟著框尺寸連續變化，框差 1px 整片格線就重新切分、每幀閃動；量化到 2 的冪後
+    只有框尺寸變化約 41% 以上才會換一級。
+    """
+    blocks = max(3, 18 - strength * 2)  # strength 越大格子越大
+    raw = max(4, min(x2 - x1, y2 - y1) // blocks)
+    return 1 << (raw.bit_length() - 1)
+
+
 def censor_region(frame, x1, y1, x2, y2, mode: str, strength: int, ellipse: bool):
     roi = frame[y1:y2, x1:x2]
     if roi.size == 0:
         return
 
     if mode == "mosaic":
-        # strength 越大格子越大（越模糊）；至少保留 3 格
-        blocks = max(3, 18 - strength * 2)
-        small = cv2.resize(roi, (blocks, blocks), interpolation=cv2.INTER_LINEAR)
-        censored = cv2.resize(small, (roi.shape[1], roi.shape[0]), interpolation=cv2.INTER_NEAREST)
+        # 格子以「畫面絕對座標」為基準切（格線落在 B 的倍數上），框往哪邊挪一兩格都只影響邊緣格，
+        # 中間的格子顏色與位置不變；原本以 ROI 左上角為基準，框動 1px 整片格子就跟著位移閃動
+        b = mosaic_block(x1, y1, x2, y2, strength)
+        fh, fw = frame.shape[:2]
+        ax1, ay1 = (x1 // b) * b, (y1 // b) * b
+        ax2, ay2 = min(fw, -(-x2 // b) * b), min(fh, -(-y2 // b) * b)
+        region = frame[ay1:ay2, ax1:ax2]
+        nx, ny = -(-(ax2 - ax1) // b), -(-(ay2 - ay1) // b)
+        small = cv2.resize(region, (nx, ny), interpolation=cv2.INTER_AREA)
+        big = cv2.resize(small, (nx * b, ny * b), interpolation=cv2.INTER_NEAREST)
+        censored = big[y1 - ay1:y2 - ay1, x1 - ax1:x2 - ax1]
     else:  # blur
         # kernel 跟著 ROI 尺寸走才有足夠遮蔽力，但大 ROI 直接模糊極慢（4K 滿版臉 k≈550，
         # 單框要 1.2s）；先把長邊縮到 256 再用等比例 kernel 模糊、放大回去，
@@ -827,10 +845,18 @@ class StreamTracker:
     轉到極端角度時模型分數會掉到 0.2-0.3 而漏幀，靠前後幀的高分軌跡作保就能接住，而弱框單獨出現時
     （紋理、圓弧物體）不會產生任何打碼。
 
-    尺寸平滑（smooth）：輸出時每個框的寬高取同一軌跡前後 ±smooth 幀偵測框的最大值、中心沿用當幀。
-    臉框／頭框在某些幀只剩其一、YOLO 框逐幀抖動，都會讓打碼區域忽大忽小；遮蔽寧大勿小，取窗內最大
-    尺寸就穩定了。輸出已延遲 delay 幀，往後看 smooth 幀不需額外緩衝。
+    平滑（smooth）：輸出框 = 同一軌跡前後 ±smooth 幀偵測框「位移補償後」的聯集。每幀偵測框都有
+    ±1-2% 的抖動、臉框／頭框某些幀只剩其一，直接輸出會讓打碼區域忽大忽小。單純取窗內聯集在頭
+    移動時會拖出一條長影；單純「最大尺寸＋當幀中心」中心仍跟著抖。這裡先算每幀的平滑中心
+    （窗內中心的中位數），把窗內每個框平移到「當幀平滑中心 − 該幀平滑中心」的位置後再取聯集：
+    靜止時等於窗內聯集（極值很少變）、移動時各框對齊不拖影、臉框與頭框的形狀差仍被同時蓋住，
+    且一定包含當幀偵測框。輸出已延遲 delay 幀，往後看 smooth 幀不需額外緩衝。
+    最後加一層逐邊死區：以上一幀輸出為基準，每邊向外只擴到剛好蓋住當幀偵測框、向內只縮到離
+    新平滑框 HYSTERESIS（5%）以內——靜止時打碼區域完全不動（只在出現新極值時外擴幾個像素），
+    移動時前緣跟偵測框、後緣跟平滑框平順移動，不會整個框重算而跳動。
     """
+
+    HYSTERESIS = 0.05  # 死區：輸出框每邊與新平滑框相差不到此比例（取短邊）就沿用上一幀
 
     def __init__(self, iou_thresh: float = 0.3, max_gap: int = 15, extend: int = 6, min_hits: int = 2,
                  smooth: int = 6):
@@ -912,8 +938,9 @@ class StreamTracker:
         out = self._emit(idx - self.delay)
         # 已結束且終點延伸也輸出完的軌跡可以丟掉
         self.tracks = [t for t in self.tracks if idx - t["last"] <= self.delay + self.extend]
-        # 已輸出且平滑窗也用不到的舊偵測框釋放掉，長軌跡的字典才不會無限長大（保留 last）
-        cutoff = idx - self.delay - self.smooth
+        # 已輸出且平滑窗也用不到的舊偵測框釋放掉，長軌跡的字典才不會無限長大（保留 last）。
+        # 平滑要算窗內每一幀各自的平滑中心，往回看到 2*smooth
+        cutoff = idx - self.delay - 2 * self.smooth
         for t in self.tracks:
             bx = t["boxes"]
             while len(bx) > 1:
@@ -927,18 +954,54 @@ class StreamTracker:
         """影片結束：輸出所有還在緩衝的畫面。"""
         return self._emit(self.idx - 1)
 
+    def _center(self, bx: dict, f: int) -> tuple[float, float]:
+        """幀 f 的平滑中心：f ± smooth 幀內偵測框中心的（逐座標）中位數。"""
+        xs, ys = [], []
+        for g, b in bx.items():
+            if abs(g - f) <= self.smooth:
+                xs.append(b[0] + b[2] / 2)
+                ys.append(b[1] + b[3] / 2)
+        xs.sort()
+        ys.sort()
+        return xs[len(xs) // 2], ys[len(ys) // 2]
+
     def _smoothed(self, t: dict, e: int, box) -> tuple:
-        """框寬高取軌跡在 e ± smooth 幀內偵測框的最大值，中心沿用 box。"""
+        """位移補償聯集：窗內每個偵測框平移到當幀的平滑中心後取聯集（見類別說明）。"""
         if self.smooth <= 0:
             return box
-        bw, bh = box[2], box[3]
-        for f, b in t["boxes"].items():
-            if abs(f - e) <= self.smooth:
-                bw, bh = max(bw, b[2]), max(bh, b[3])
-        if bw == box[2] and bh == box[3]:
+        bx = t["boxes"]
+        win = [(f, b) for f, b in bx.items() if abs(f - e) <= self.smooth]
+        if not win:
             return box
-        cx, cy = box[0] + box[2] / 2, box[1] + box[3] / 2
-        return int(round(cx - bw / 2)), int(round(cy - bh / 2)), bw, bh
+        cx, cy = self._center(bx, e)
+        x1, y1, x2, y2 = box[0], box[1], box[0] + box[2], box[1] + box[3]
+        for f, b in win:
+            fx, fy = self._center(bx, f)
+            dx, dy = cx - fx, cy - fy
+            x1 = min(x1, b[0] + dx)
+            y1 = min(y1, b[1] + dy)
+            x2 = max(x2, b[0] + b[2] + dx)
+            y2 = max(y2, b[1] + b[3] + dy)
+        x1, y1 = int(round(x1)), int(round(y1))
+        out = (x1, y1, int(round(x2)) - x1, int(round(y2)) - y1)
+        prev = t.get("out")
+        if prev is None:
+            t["out"] = out
+            return out
+        # 逐邊死區：每一邊以上一幀輸出為基準，向外只擴到剛好蓋住當幀偵測框（隱私不打折），
+        # 向內只縮到離新平滑框 HYSTERESIS 以內。靜止時只有出現新極值才外擴幾個像素、其餘完全不動；
+        # 移動時前緣跟著偵測框、後緣跟著平滑框平順移動，沒有「整個框重算」造成的跳動
+        slack = max(2, int(round(self.HYSTERESIS * min(out[2], out[3]))))
+        px1, py1, px2, py2 = prev[0], prev[1], prev[0] + prev[2], prev[1] + prev[3]
+        bx1, by1, bx2, by2 = box[0], box[1], box[0] + box[2], box[1] + box[3]
+        ox1, oy1, ox2, oy2 = out[0], out[1], out[0] + out[2], out[1] + out[3]
+        nx1 = max(min(px1, bx1), ox1 - slack)
+        ny1 = max(min(py1, by1), oy1 - slack)
+        nx2 = min(max(px2, bx2), ox2 + slack)
+        ny2 = min(max(py2, by2), oy2 + slack)
+        out = (nx1, ny1, nx2 - nx1, ny2 - ny1)
+        t["out"] = out
+        return out
 
     def _emit(self, upto: int) -> list[tuple[np.ndarray, list]]:
         out = []
@@ -1712,7 +1775,8 @@ def main():
                         help="追蹤延續門檻：分數在此之上、未達 --conf/--head-conf 的弱框只用來延續既有軌跡"
                              "（頭低到只剩頭頂、極端角度時接住漏幀），單獨出現不打碼；設成與 --conf 相同即停用")
     parser.add_argument("--smooth", type=int, default=6,
-                        help="追蹤框尺寸平滑：寬高取前後 N 幀偵測框的最大值，消除臉框／頭框交替造成的忽大忽小；0 停用")
+                        help="追蹤框平滑：輸出框取前後 N 幀偵測框位移補償後的聯集，消除偵測抖動與臉框／頭框交替"
+                             "造成的忽大忽小（移動時不拖影）；0 停用")
     parser.add_argument("--no-multiscale", dest="multiscale", action="store_false",
                         help="停用多尺度：預設 det-size 高於 640 時會再加一道 640 掃描取聯集，補特寫大臉")
     parser.add_argument("--rescue", action="store_true",

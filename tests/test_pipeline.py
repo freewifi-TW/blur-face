@@ -106,7 +106,7 @@ def test_tracker_plain_boxes_compatible_and_bounded():
     tr = bf.StreamTracker()
     for _ in range(600):
         tr.push(np.zeros((2, 2, 3), np.uint8), [D((100, 100, 80, 80), 0.9, True)])
-    assert all(len(t["boxes"]) <= tr.delay + tr.smooth + 2 for t in tr.tracks)
+    assert all(len(t["boxes"]) <= tr.delay + 2 * tr.smooth + 2 for t in tr.tracks)
 
 
 # ---------------------------------------------------------------------------
