@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
 
 from blur_faces import (
     IMAGE_EXTS, VIDEO_EXTS, create_detector, default_output, device_label,
-    pick_encoder, process_image, process_video, runtime_info,
+    pick_encoder, plan_outputs, process_image, process_video, runtime_info,
 )
 
 MEDIA_EXTS = IMAGE_EXTS | VIDEO_EXTS
@@ -33,6 +33,16 @@ MEDIA_EXTS = IMAGE_EXTS | VIDEO_EXTS
 # 處理紀錄與崩潰追蹤同步寫到這裡：GUI 閃退（原生層崩潰）時視窗內的紀錄會消失，檔案是唯一線索
 LOG_DIR = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "BlurFace"
 _crash_file = None  # 保持開啟，faulthandler 需要存活的檔案物件
+LOG_ROTATE_BYTES = 5 * 1024 * 1024  # 紀錄檔超過此大小就輪替（心跳每 15 秒一行，幾個月會長很大）
+
+
+def rotate_log(path: Path, limit: int = LOG_ROTATE_BYTES):
+    """紀錄檔超過 limit 就改名成 .1 保留一份，避免無限成長。任何失敗都忽略。"""
+    try:
+        if path.exists() and path.stat().st_size > limit:
+            path.replace(path.with_suffix(path.suffix + ".1"))
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def enable_crash_log():
@@ -40,6 +50,7 @@ def enable_crash_log():
     global _crash_file
     try:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
+        rotate_log(LOG_DIR / "crash.log")
         _crash_file = open(LOG_DIR / "crash.log", "a", encoding="utf-8", errors="replace")
         _crash_file.write(f"\n===== {datetime.now():%Y-%m-%d %H:%M:%S} 啟動 =====\n")
         _crash_file.flush()
@@ -99,6 +110,7 @@ class Worker(QThread):
         self.files = files
         self.args = args
         self.out_dir = out_dir
+        self.outputs = plan_outputs(files, out_dir)  # 同名輸出自動加序號，不互相覆蓋
         self.cancelled = False
         # 設定沒變時沿用上一輪的偵測器：每輪重建 GPU session 會累積未釋放的顯示卡資源，
         # 幾輪後 DirectML 初始化失敗、默默退回 CPU（症狀：GPU 0%、CPU 飆高、速度極慢）
@@ -139,13 +151,27 @@ class Worker(QThread):
 
         n_files = len(self.files)
         ok = fail = total_faces = 0
-        for i, path in enumerate(self.files):
+        for path, out in zip(self.files, self.outputs):
+            if out.name != default_output(path, self.out_dir).name:
+                log(f"輸出撞名：{path} → 改存為 {out.name}")
+        for i, (path, out) in enumerate(zip(self.files, self.outputs)):
             if self.cancelled:
                 break
+            if detector is None:
+                # 上一個檔案的偵測器出錯（GPU 裝置遺失等）已被丟棄：重建一次再繼續，重建不了就結束這批
+                try:
+                    t0 = time.time()
+                    detector = self.detector = create_detector(self.args, log=log)
+                    log(f"偵測器已重建（{time.time() - t0:.1f}s），裝置：{device_label(detector)}")
+                except SystemExit as e:
+                    log(f"✗ 偵測器重建失敗：{e}，剩餘 {n_files - i} 個檔案略過")
+                    for j in range(i, n_files):
+                        self.sig_item.emit(j, "✗ 偵測器無法重建")
+                    fail += n_files - i
+                    break
             self.sig_item.emit(i, "處理中…")
             if self.out_dir:
                 self.out_dir.mkdir(parents=True, exist_ok=True)
-            out = default_output(path, self.out_dir)
 
             def progress(done, total, i=i):
                 if total > 0 and done % 5 == 0:
@@ -153,21 +179,22 @@ class Worker(QThread):
                     self.sig_item.emit(i, f"處理中… {pct_file:.0%}")
                     self.sig_overall.emit(int((i + pct_file) / n_files * 100))
 
+            report: dict = {}
             try:
                 if path.suffix.lower() in VIDEO_EXTS:
                     result = process_video(
                         path, out, detector, self.args,
                         log=log, progress=progress,
-                        cancel=lambda: self.cancelled,
+                        cancel=lambda: self.cancelled, report=report,
                     )
                     if result is None:
-                        raise RuntimeError("已取消" if self.cancelled else "無法解碼")
+                        raise RuntimeError(report.get("reason") or ("已取消" if self.cancelled else "處理失敗"))
                     frames, faces = result
                     self.sig_item.emit(i, f"✓ {faces} 次人臉偵測 / {frames} 幀")
                 else:
-                    faces = process_image(path, out, detector, self.args, log=log)
+                    faces = process_image(path, out, detector, self.args, log=log, report=report)
                     if faces is None:
-                        raise RuntimeError("無法讀取")
+                        raise RuntimeError(report.get("reason") or "無法讀取")
                     self.sig_item.emit(i, f"✓ {faces} 張人臉")
                 ok += 1
                 total_faces += faces
@@ -175,6 +202,9 @@ class Worker(QThread):
                 fail += 1
                 log(f"✗ {path.name}：{e}")
                 self.sig_item.emit(i, f"✗ {e}")
+            if report.get("detector_failed"):
+                log("⚠ 偵測器在這個檔案上出錯，處理下一個檔案前會重建；本輪結束後不沿用這個偵測器")
+                detector = self.detector = None
             self.sig_overall.emit(int((i + 1) / n_files * 100))
 
         if self.cancelled:
@@ -196,8 +226,10 @@ class MainWindow(QMainWindow):
         self.out_dir: Path | None = None
         self.cached_detector = None   # 跨輪沿用的偵測器（見 Worker.__init__ 說明）；self.detector 是下拉選單
         self.detector_key = None      # 建立該偵測器時的設定，設定變了才重建
+        self.outputs: dict[Path, Path] = {}  # 最近一輪每個輸入對應的輸出路徑（撞名時有加序號）
         self.logged_env = False
         try:  # 處理紀錄同步落檔：閃退後視窗紀錄消失，檔案裡還在
+            rotate_log(LOG_DIR / "blurface.log")
             self._logfile = open(LOG_DIR / "blurface.log", "a", encoding="utf-8", errors="replace")
             self._logfile.write(f"\n===== {datetime.now():%Y-%m-%d %H:%M:%S} 啟動 =====\n")
             self._logfile.flush()
@@ -220,11 +252,13 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.list, stretch=1)
 
         btns = QHBoxLayout()
+        self.list_btns: list[QPushButton] = []  # 處理中要一起停用：清單變動會讓進度回報對不上列
         for text, fn in [("加入檔案", self.pick_files), ("加入資料夾", self.pick_dir),
                          ("移除選取", self.remove_selected), ("清空", self.clear_all)]:
             b = QPushButton(text)
             b.clicked.connect(fn)
             btns.addWidget(b)
+            self.list_btns.append(b)
         layout.addLayout(btns)
 
         # --- 參數 ---
@@ -448,7 +482,8 @@ class MainWindow(QMainWindow):
 
     def open_output(self, item):
         """雙擊已完成的項目 → 用系統預設程式開啟輸出檔。"""
-        out = default_output(self.files[self.list.row(item)], self.out_dir)
+        src = self.files[self.list.row(item)]
+        out = self.outputs.get(src) or default_output(src, self.out_dir)
         if out.exists():
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(out)))
 
@@ -521,6 +556,7 @@ class MainWindow(QMainWindow):
             self.detector_key = key
             gc.collect()  # 先把舊 session 的 GPU 資源還回去，再建新的
         self.worker = Worker(list(self.files), args, self.out_dir, self.cached_detector)
+        self.outputs = dict(zip(self.worker.files, self.worker.outputs))
         self.worker.sig_item.connect(self.on_item)
         self.worker.sig_overall.connect(self.progress.setValue)
         self.worker.sig_done.connect(self.on_done)
@@ -534,7 +570,9 @@ class MainWindow(QMainWindow):
             self.status.setText("取消中…")
 
     def on_item(self, row: int, text: str):
-        self.list.item(row).setText(f"{self.files[row].name} — {text}")
+        item = self.list.item(row)
+        if item is not None and row < len(self.files):  # 清單在處理中被改動時不要炸掉
+            item.setText(f"{self.files[row].name} — {text}")
 
     def on_done(self, summary: str):
         if self.worker is not None:
@@ -556,8 +594,10 @@ class MainWindow(QMainWindow):
         self.start_btn.setEnabled(not busy)
         self.cancel_btn.setEnabled(busy)
         for w in (self.mode, self.strength, self.detector, self.det_size, self.conf, self.pad,
-                  self.ellipse, self.head, self.track, self.rescue, self.gpu, self.hw_encode, self.out_btn):
+                  self.ellipse, self.head, self.track, self.rescue, self.gpu, self.hw_encode, self.out_btn,
+                  *self.list_btns):
             w.setEnabled(not busy)
+        self.list.setAcceptDrops(not busy)
         self.head_conf.setEnabled(not busy and self.head.isChecked())
 
 
@@ -566,14 +606,30 @@ def smoke_test() -> int:
     import numpy as np
     from blur_faces import find_ffmpeg
 
+    import tempfile
+    import cv2
+
     app = QApplication(sys.argv)
     win = MainWindow()  # noqa: F841 確認 UI 可建立
     det = create_detector(argparse.Namespace(detector="scrfd", conf=0.4, det_size=640, head=True, device="auto"))
     det.detect(np.zeros((480, 640, 3), dtype=np.uint8))
     assert find_ffmpeg(), "找不到 ffmpeg"
     encoder = pick_encoder("auto")[0]
+    # 打包後的 ffmpeg 二進位是否真的能被 stdin 餵幀、寫出檔案：跑一支 12 幀的合成影片走完整管線
+    with tempfile.TemporaryDirectory() as td:
+        src = Path(td) / "smoke.mp4"
+        wr = cv2.VideoWriter(str(src), cv2.VideoWriter_fourcc(*"mp4v"), 24, (320, 240))
+        for _ in range(12):
+            wr.write(np.full((240, 320, 3), 128, dtype=np.uint8))
+        wr.release()
+        args = argparse.Namespace(mode="mosaic", strength=5, pad=0.15, keep=4, ellipse=False, track=True,
+                                  min_hits=2, smooth=6, encoder="auto")
+        report: dict = {}
+        result = process_video(src, Path(td) / "smoke_blurred.mp4", det, args, log=lambda _s: None, report=report)
+        assert result and result[0] == 12, f"影片管線失敗：{report}"
+        assert report.get("sink") == "ffmpeg", f"沒有走 ffmpeg 輸出：{report}"
     if sys.stdout is not None:  # Windows --windowed 模式下 stdout 為 None
-        print(f"SMOKE OK  偵測裝置={device_label(det)}  編碼器={encoder}")
+        print(f"SMOKE OK  偵測裝置={device_label(det)}  編碼器={encoder}  影片管線={report.get('encoder')}")
     return 0
 
 

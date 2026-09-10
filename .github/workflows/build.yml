@@ -30,7 +30,14 @@ jobs:
         with:
           python-version: "3.12"
 
-      - run: pip install -r requirements.txt
+      # 用鎖定版本安裝：每次打包拿到的相依套件都一樣，升級要先過測試再改 requirements.lock
+      - run: pip install -r requirements.lock pytest
+
+      # 單元與管線測試（stub 偵測器 + 合成影片 + 真實模型冒煙），失敗就不打包
+      - name: Run tests
+        env:
+          PYTHONUTF8: "1"
+        run: python -m pytest -q tests
 
       # PyInstaller 預編譯的 bootloader 被所有 PyInstaller 程式共用，早被防毒的 ML 模型學成「可疑特徵」，
       # 是 Windows Defender 誤報 Trojan:Win32/Wacatac.C!ml 的主因。

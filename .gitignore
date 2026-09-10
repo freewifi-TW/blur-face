@@ -7,3 +7,5 @@ dist/
 *.spec
 .DS_Store
 blur-face/
+.pytest_cache/
+*.part.*

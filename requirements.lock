@@ -1,0 +1,10 @@
+# 鎖定版本：CI 打包與本機測試都用這份安裝，套件升級要經過測試再改這裡。
+# requirements.txt 保留寬鬆範圍給開發時參考；兩份的套件清單要一致。
+# 更新方式：改版本號 → 本機 pip install -r requirements.lock → python -m pytest tests → 推 tag。
+opencv-python==5.0.0.93
+numpy==2.5.3
+onnxruntime==1.29.0; sys_platform != "win32"
+onnxruntime-directml==1.24.4; sys_platform == "win32"
+onnx==1.22.0
+PySide6==6.11.2
+imageio-ffmpeg==0.6.0

@@ -1,3 +1,4 @@
+# 寬鬆版本範圍供開發參考；CI 打包與本機測試請用 requirements.lock（鎖定版本）。
 opencv-python>=4.10
 numpy
 # 偵測推論引擎：Windows 用 DirectML 版（GPU 加速，NVIDIA/AMD/Intel 含內顯皆可，不需 CUDA）；

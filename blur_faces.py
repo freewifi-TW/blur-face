@@ -9,6 +9,7 @@
 
 import argparse
 import queue
+import re
 import shutil
 from concurrent.futures import ThreadPoolExecutor
 import subprocess
@@ -84,7 +85,8 @@ MODELS_DIR = resource_path("models")
 SCRFD_MODEL = MODELS_DIR / "det_10g.onnx"
 YUNET_MODEL = MODELS_DIR / "face_detection_yunet_2023mar.onnx"
 HEAD_MODEL = MODELS_DIR / "crowdhuman_yolov5m.onnx"
-IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff", ".heic", ".heif", ".avif"}
+_FFMPEG_ONLY_IMAGE_EXTS = {".heic", ".heif", ".avif"}  # OpenCV 不支援，交給 ffmpeg 解碼；輸出改存 .jpg
 VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".m4v", ".webm"}
 
 DEVICE_CHOICES = ("auto", "cpu", "gpu")
@@ -105,6 +107,80 @@ _GPU_PROVIDERS = [
     # 有另外裝 onnxruntime-gpu 與 CUDA 的環境。
     ("CUDAExecutionProvider", {}),
 ]
+
+
+def _dxgi_adapters() -> list[tuple[str, int, bool]]:
+    """列舉 DXGI 顯示卡，順序即 DirectML 的 device_id：(名稱, 專用顯示記憶體 MB, 是否為軟體轉譯器)。
+
+    純 ctypes 呼叫 COM vtable（CreateDXGIFactory1 → IDXGIFactory1::EnumAdapters1 → IDXGIAdapter1::GetDesc1），
+    不需額外套件。非 Windows 或任何失敗回傳空清單。
+    """
+    if sys.platform != "win32":
+        return []
+    try:
+        import ctypes
+        import ctypes.wintypes as wt
+
+        class _LUID(ctypes.Structure):
+            _fields_ = [("LowPart", wt.DWORD), ("HighPart", wt.LONG)]
+
+        class _DESC1(ctypes.Structure):
+            _fields_ = [("Description", wt.WCHAR * 128), ("VendorId", wt.UINT), ("DeviceId", wt.UINT),
+                        ("SubSysId", wt.UINT), ("Revision", wt.UINT),
+                        ("DedicatedVideoMemory", ctypes.c_size_t), ("DedicatedSystemMemory", ctypes.c_size_t),
+                        ("SharedSystemMemory", ctypes.c_size_t), ("AdapterLuid", _LUID), ("Flags", wt.UINT)]
+
+        class _GUID(ctypes.Structure):
+            _fields_ = [("a", wt.DWORD), ("b", wt.WORD), ("c", wt.WORD), ("d", ctypes.c_ubyte * 8)]
+
+        iid = _GUID(0x770AAE78, 0xF26F, 0x4DBA, (ctypes.c_ubyte * 8)(0xA8, 0x29, 0x25, 0x3C, 0x83, 0xD1, 0xB3, 0x87))
+        factory = ctypes.c_void_p()
+        if ctypes.windll.dxgi.CreateDXGIFactory1(ctypes.byref(iid), ctypes.byref(factory)) != 0:
+            return []
+
+        def method(obj, index, restype, *argtypes):
+            vtbl = ctypes.cast(ctypes.cast(obj, ctypes.POINTER(ctypes.c_void_p))[0], ctypes.POINTER(ctypes.c_void_p))
+            return ctypes.WINFUNCTYPE(restype, ctypes.c_void_p, *argtypes)(vtbl[index])
+
+        enum_adapters1 = method(factory, 12, ctypes.c_long, wt.UINT, ctypes.POINTER(ctypes.c_void_p))
+        out = []
+        i = 0
+        while True:
+            adapter = ctypes.c_void_p()
+            if enum_adapters1(factory, i, ctypes.byref(adapter)) != 0:
+                break
+            desc = _DESC1()
+            method(adapter, 10, ctypes.c_long, ctypes.POINTER(_DESC1))(adapter, ctypes.byref(desc))
+            out.append((desc.Description, int(desc.DedicatedVideoMemory // (1024 * 1024)), bool(desc.Flags & 2)))
+            method(adapter, 2, ctypes.c_ulong)(adapter)  # Release
+            i += 1
+        method(factory, 2, ctypes.c_ulong)(factory)
+        return out
+    except Exception:  # noqa: BLE001
+        return []
+
+
+_dml_choice: dict = {}
+
+
+def _dml_provider_options(log) -> dict:
+    """挑專用顯示記憶體最大的硬體顯示卡給 DirectML。
+
+    DirectML 預設 device_id 0 是「主螢幕接的那張」，同時有獨顯、內顯與 Virtual Desktop 之類的虛擬顯示卡時
+    可能挑到內顯或虛擬卡，症狀是「有用到 GPU 但極慢」。只算一次；列舉失敗就沿用預設。
+    """
+    if "opts" not in _dml_choice:
+        hw = [(i, a) for i, a in enumerate(_dxgi_adapters()) if not a[2]]
+        opts: dict = {}
+        if hw:
+            best = max(hw, key=lambda x: x[1][1])[0]
+            if best != 0:
+                opts = {"device_id": best}
+            log("DirectML 顯示卡：" + "、".join(
+                f"[{i}] {a[0]} {a[1]}MB{'（選用）' if i == best else ''}" for i, a in hw))
+        _dml_choice["opts"] = opts
+    return _dml_choice["opts"]
+
 
 _DEVICE_LABELS = {
     "CoreMLExecutionProvider": "GPU（CoreML）",
@@ -168,6 +244,8 @@ def create_session(model_path: Path, device: str, input_shape: tuple[int, ...], 
             if name not in available:
                 continue
             tried = True
+            if name == "DmlExecutionProvider":
+                opts = {**opts, **_dml_provider_options(log)}
             try:
                 t0 = time.time()
                 model = _static_shape_model(model_path, input_shape)
@@ -879,31 +957,79 @@ class StreamTracker:
 # 照片
 # ---------------------------------------------------------------------------
 
-def _imread(path: Path):
-    """cv2.imread 在 Windows 上讀不到含中文等非 ASCII 字元的路徑（回傳 None），改用 imdecode。"""
+def _imread_ffmpeg(path: Path):
+    """OpenCV 不支援的格式（iPhone 的 HEIC/HEIF、AVIF）交給 ffmpeg 解成 PNG 再讀；沒有 ffmpeg 或不支援回傳 None。"""
+    ffmpeg = find_ffmpeg()
+    if not ffmpeg:
+        return None
     try:
-        return cv2.imdecode(np.fromfile(str(path), dtype=np.uint8), cv2.IMREAD_COLOR)
+        r = subprocess.run(
+            [ffmpeg, "-hide_banner", "-loglevel", "error", "-i", str(path),
+             "-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "-"],
+            capture_output=True, timeout=60, **_subprocess_kwargs(),
+        )
     except Exception:  # noqa: BLE001
         return None
+    if r.returncode != 0 or not r.stdout:
+        return None
+    return cv2.imdecode(np.frombuffer(r.stdout, dtype=np.uint8), cv2.IMREAD_COLOR)
+
+
+def _imread(path: Path):
+    """讀圖：cv2.imread 在 Windows 上讀不到含中文等非 ASCII 字元的路徑，改用 imdecode；
+    OpenCV 解不開的格式再退到 ffmpeg。"""
+    img = None
+    if path.suffix.lower() not in _FFMPEG_ONLY_IMAGE_EXTS:
+        try:
+            img = cv2.imdecode(np.fromfile(str(path), dtype=np.uint8), cv2.IMREAD_COLOR)
+        except Exception:  # noqa: BLE001
+            img = None
+    return img if img is not None else _imread_ffmpeg(path)
+
+
+def _part_path(path: Path) -> Path:
+    """輸出先寫到同目錄的暫存名（x_blurred.part.mp4），完成才改名：中途閃退不會留下看似完整的半成品。"""
+    return path.with_name(f"{path.stem}.part{path.suffix}")
 
 
 def _imwrite(path: Path, img: np.ndarray) -> bool:
     ok, buf = cv2.imencode(path.suffix or ".png", img)
-    if ok:
-        buf.tofile(str(path))
-    return bool(ok)
+    if not ok:
+        return False
+    tmp = _part_path(path)
+    buf.tofile(str(tmp))
+    tmp.replace(path)
+    return True
 
 
-def process_image(path: Path, out_path: Path, detector, args, log=print):
+def process_image(path: Path, out_path: Path, detector, args, log=print, report: dict | None = None):
+    """處理單張照片，回傳偵測到的人臉數；失敗回傳 None。
+
+    report（可選）會寫入 reason（失敗原因）與 detector_failed（偵測器本身出錯，呼叫端應重建）。
+    """
+    report = report if report is not None else {}
     img = _imread(path)
     if img is None:
+        report["reason"] = "無法讀取圖片"
         log(f"⚠ 無法讀取圖片：{path}")
         return None
     reset_rescue(detector)  # 照片彼此獨立，不繼承前一檔的補救冷卻
     t0 = time.time()
     before = rescue_stats(detector)
-    n = process_frame(img, detector, args)
-    if not _imwrite(out_path, img):
+    try:
+        n = process_frame(img, detector, args)
+    except Exception as e:  # noqa: BLE001 — 偵測器（GPU 裝置遺失等）出錯：標記讓呼叫端重建
+        report["reason"] = f"偵測失敗：{e}"
+        report["detector_failed"] = True
+        log(f"⚠ 無法處理 {path.name}：偵測失敗：{e}")
+        return None
+    try:
+        ok = _imwrite(out_path, img)
+    except Exception as e:  # noqa: BLE001
+        ok = False
+        log(f"⚠ 寫出圖片失敗：{e}")
+    if not ok:
+        report["reason"] = "無法寫出圖片"
         log(f"⚠ 無法寫出圖片：{out_path}")
         return None
     after = rescue_stats(detector)
@@ -971,11 +1097,27 @@ def pick_encoder(mode: str = "auto") -> tuple[str, list[str]]:
     return _encoder_cache[mode]
 
 
+def _probe_audio_codec(ffmpeg: str, path: Path) -> str | None:
+    """回傳來源第一條音軌的編碼名稱（aac、pcm_s16le…），沒有音軌或探測失敗回傳 None。"""
+    try:
+        err = subprocess.run(
+            [ffmpeg, "-hide_banner", "-i", str(path)], capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=30, **_subprocess_kwargs(),
+        ).stderr
+    except Exception:  # noqa: BLE001
+        return None
+    m = re.search(r"Audio: (\w+)", err)
+    return m.group(1).lower() if m else None
+
+
 class _FfmpegWriter:
-    """把 BGR 畫面經 stdin 送給 ffmpeg，一次完成編碼與原始音軌合併（不經中間檔、不重複壓縮）。"""
+    """把 BGR 畫面經 stdin 送給 ffmpeg，一次完成編碼與原始音軌合併（不經中間檔、不重複壓縮）。
+
+    audio_codec="copy" 時音軌原樣複製（來源已是 AAC），否則重壓成 AAC。
+    """
 
     def __init__(self, ffmpeg: str, out_path: Path, original: Path, fps: float,
-                 size: tuple[int, int], encoder: tuple[str, list[str]]):
+                 size: tuple[int, int], encoder: tuple[str, list[str]], audio_codec: str = "aac"):
         w, h = size
         self.encoder, opts = encoder
         self._err = tempfile.TemporaryFile()
@@ -988,7 +1130,7 @@ class _FfmpegWriter:
             "-c:v", self.encoder, *opts,
             "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",  # H.264 yuv420p 需要偶數邊長
             "-pix_fmt", "yuv420p",
-            "-c:a", "aac", "-shortest", "-movflags", "+faststart",
+            "-c:a", audio_codec, "-shortest", "-movflags", "+faststart",
             str(out_path),
         ]
         self.proc = subprocess.Popen(
@@ -1001,19 +1143,44 @@ class _FfmpegWriter:
     def write_raw(self, raw: bytes):
         self.proc.stdin.write(raw)  # ffmpeg 掛掉時會丟 BrokenPipeError
 
-    def close(self, abort: bool = False) -> str | None:
-        """結束編碼並回傳 ffmpeg 的錯誤訊息（成功為 None）。abort=True 時直接中止。"""
+    def close(self, abort: bool = False, cancel=None, timeout: float = 600.0) -> str | None:
+        """結束編碼並回傳 ffmpeg 的錯誤訊息（成功為 None）。
+
+        abort=True 直接中止。否則等 ffmpeg 收尾（faststart 會把整個檔重寫一遍，4K 長片要幾十秒），
+        期間 cancel() 為真或超過 timeout 秒就強制結束——ffmpeg 卡死時不會讓整個程式停在「收尾」。
+        """
         try:
             self.proc.stdin.close()
         except Exception:
             pass
         if abort:
             self.proc.terminate()
-        rc = self.proc.wait()
+        deadline = time.time() + timeout
+        forced = None
+        while True:
+            try:
+                rc = self.proc.wait(timeout=1.0)
+                break
+            except subprocess.TimeoutExpired:
+                if time.time() > deadline:
+                    forced = f"ffmpeg 收尾超過 {timeout:.0f} 秒沒有結束，已強制中止"
+                elif cancel is not None and cancel():
+                    forced = "使用者取消"
+                else:
+                    continue
+                self.proc.terminate()
+                try:
+                    rc = self.proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.proc.kill()
+                    rc = self.proc.wait()
+                break
         self._err.seek(0)
         msg = self._err.read().decode(errors="replace").strip()
         self._err.close()
-        return None if rc == 0 else (msg or f"ffmpeg 結束碼 {rc}")
+        if rc == 0 and forced is None:
+            return None
+        return forced or msg or f"ffmpeg 結束碼 {rc}"
 
 
 class _Cv2Writer:
@@ -1138,13 +1305,16 @@ class _Heartbeat:
             last_frames = frames
 
 
-def _open_video(path: Path, log):
+def _open_video(path: Path, log, hw: bool = True):
     """開啟影片，優先用 FFmpeg 後端的硬體加速解碼（NVDEC / D3D11 / QSV，由 FFmpeg 自選）。
 
     先開一次並試讀第一幀確認可用，再重開一次從頭讀；試讀失敗（驅動或格式不支援）
     就退回預設開法。VIDEO_ACCELERATION_ANY 本身允許 FFmpeg 內部退回軟解，這裡的
-    失敗處理只是保險。
+    失敗處理只是保險。hw=False 直接用軟體解碼（硬體解碼中途斷掉時的重跑）。
     """
+    if not hw:
+        log("解碼：軟體解碼")
+        return cv2.VideoCapture(str(path))
     if hasattr(cv2, "CAP_PROP_HW_ACCELERATION"):
         params = [cv2.CAP_PROP_HW_ACCELERATION, cv2.VIDEO_ACCELERATION_ANY]
         try:
@@ -1162,14 +1332,20 @@ def _open_video(path: Path, log):
     return cv2.VideoCapture(str(path))
 
 
-_RETRY = object()  # _process_video_once 的回傳哨兵：ffmpeg 編碼失敗，請改用 OpenCV 重跑
+_RETRY = object()     # _process_video_once 的回傳哨兵：這個編碼器失敗，請換下一個重跑
+_RETRY_SW = object()  # 硬體解碼提前結束，請改軟體解碼重跑
 
 
-def _process_video_once(path, out_path, detector, args, sink: str, ffmpeg, log, progress, cancel):
-    encoder = pick_encoder(getattr(args, "encoder", "auto")) if sink == "ffmpeg" else None
+def _truncated(frames_read: int, total: int) -> bool:
+    """解碼幀數明顯少於容器宣告的總幀數（容器常多算 1-2 幀，給 0.5% 容忍）。"""
+    return total > 0 and total - frames_read > max(2, int(total * 0.005))
 
-    cap = _open_video(path, log)
+
+def _process_video_once(path, out_path, detector, args, sink: str, encoder, ffmpeg, log, progress, cancel,
+                        hw_decode: bool, report: dict):
+    cap = _open_video(path, log, hw=hw_decode)
     if not cap.isOpened():
+        report["reason"] = "無法開啟影片"
         log(f"⚠ 無法開啟影片：{path}")
         return None
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
@@ -1181,16 +1357,19 @@ def _process_video_once(path, out_path, detector, args, sink: str, ffmpeg, log, 
     stats = {"frames_read": 0, "written": 0, "faces": 0, "covered": 0, "cancelled": False,
              "t_decode": 0.0, "t_detect": 0.0, "t_track": 0.0, "t_censor": 0.0,
              "t_tobytes": 0.0, "t_pipe": 0.0, "phase": None, "t_advance": time.time(),
-             "last_boxes": 0, "max_boxes": 0, "last_max_side": 0}
+             "last_boxes": 0, "max_boxes": 0, "last_max_side": 0, "pos_ms": 0.0}
     reset_rescue(detector)  # 新影片不繼承上一檔的補救冷卻
     rescue_before = rescue_stats(detector)
     t_start = time.time()
+    # 來源音軌已是 AAC 就原樣複製，少一次有損壓縮也少一個失敗點
+    audio_codec = "copy" if sink == "ffmpeg" and _probe_audio_codec(ffmpeg, path) == "aac" else "aac"
 
-    def report(done: int):
+    def report_progress(done: int):
         if progress is not None:  # GUI 進度條；CLI 進度改由 _Heartbeat 統一回報
             progress(done, total)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_out = _part_path(out_path)  # 先寫暫存名，成功才改名成正式輸出
 
     # --- 三段式管線：解碼 → 偵測+追蹤 → 打碼+編碼，各在自己的執行緒重疊執行 ---
     # cap.read / onnxruntime session.run / cv2 運算都會釋放 GIL，執行緒化是真併行；
@@ -1233,8 +1412,9 @@ def _process_video_once(path, out_path, detector, args, sink: str, ffmpeg, log, 
                 if not ok:
                     break
                 stats["frames_read"] += 1
+                stats["pos_ms"] = cap.get(cv2.CAP_PROP_POS_MSEC)  # 最後一幀的時間戳，結尾用來檢查可變幀率
                 stats["t_advance"] = time.time()
-                report(stats["frames_read"])
+                report_progress(stats["frames_read"])
                 if not _put(q_dec, frame):
                     return
         except Exception as e:  # noqa: BLE001
@@ -1302,8 +1482,8 @@ def _process_video_once(path, out_path, detector, args, sink: str, ffmpeg, log, 
                     h, w = frame.shape[:2]
                     writer_box["size"] = (w, h)
                     writer_box["writer"] = (
-                        _FfmpegWriter(ffmpeg, out_path, path, fps, (w, h), encoder)
-                        if sink == "ffmpeg" else _Cv2Writer(out_path, fps, (w, h))
+                        _FfmpegWriter(ffmpeg, tmp_out, path, fps, (w, h), encoder, audio_codec)
+                        if sink == "ffmpeg" else _Cv2Writer(tmp_out, fps, (w, h))
                     )
                 if sink == "ffmpeg":
                     t0 = time.time()
@@ -1338,10 +1518,13 @@ def _process_video_once(path, out_path, detector, args, sink: str, ffmpeg, log, 
         writer_err = None
         if writer is not None:
             _t = time.time()
-            writer_err = writer.close(abort=stats["cancelled"] or bool(fail))
+            writer_err = writer.close(abort=stats["cancelled"] or bool(fail), cancel=cancel)
             t_finalize = time.time() - _t
+            if not stats["cancelled"] and cancel is not None and cancel():
+                stats["cancelled"] = True  # 收尾期間被取消
     stats["phase"] = "done"
     written = stats["written"]
+    frames_read = stats["frames_read"]
     error = writer_err or fail.get("write")
     elapsed = max(time.time() - t_start, 1e-9)
     stats["t_write"] = stats["t_tobytes"] + stats["t_pipe"]
@@ -1353,25 +1536,54 @@ def _process_video_once(path, out_path, detector, args, sink: str, ffmpeg, log, 
     parts = ", ".join(f"{zh} {t / elapsed:.0%}" for zh, t in seg if t / elapsed >= 0.005)
 
     if stats["cancelled"]:
-        out_path.unlink(missing_ok=True)
-        log(f"⚠ 已取消：{path.name}（已解碼 {stats['frames_read']} 幀、輸出 {written} 幀，"
+        tmp_out.unlink(missing_ok=True)
+        report["reason"] = "已取消"
+        log(f"⚠ 已取消：{path.name}（已解碼 {frames_read} 幀、輸出 {written} 幀，"
             f"{elapsed:.1f}s；忙碌佔比 {parts}）")
         return None
     if fail.get("decode") or fail.get("detect"):
         # 解碼/偵測層的錯誤換編碼器也救不回來，不走 ffmpeg 重試
-        out_path.unlink(missing_ok=True)
-        log(f"⚠ 無法處理 {path.name}：{fail.get('decode') or fail.get('detect')}")
+        tmp_out.unlink(missing_ok=True)
+        report["reason"] = fail.get("decode") or fail.get("detect")
+        if fail.get("detect"):
+            report["detector_failed"] = True  # 偵測器（GPU 裝置遺失等）壞了，呼叫端應重建再處理下一個檔
+        log(f"⚠ 無法處理 {path.name}：{report['reason']}")
         return None
     if error is not None:
-        out_path.unlink(missing_ok=True)
+        tmp_out.unlink(missing_ok=True)
         if sink == "ffmpeg":
-            log(f"⚠ ffmpeg 編碼失敗：{error}")
+            log(f"⚠ ffmpeg 編碼失敗（{writer.encoder if writer else encoder[0]}）：{error}")
+            report["reason"] = f"編碼失敗：{error}"
             return _RETRY
+        report["reason"] = f"無法輸出：{error}"
         log(f"⚠ 無法輸出 {path.name}：{error}")
         return None
     if written == 0:
-        out_path.unlink(missing_ok=True)
+        tmp_out.unlink(missing_ok=True)
+        report["reason"] = "無法解碼任何畫面"
         log(f"⚠ 無法解碼任何畫面：{path.name}")
+        return None
+    if _truncated(frames_read, total):
+        if hw_decode:
+            # 硬體解碼在某些驅動 / 格式上會中途無聲停止，看起來像正常結尾：改軟體解碼整支重跑
+            tmp_out.unlink(missing_ok=True)
+            report["reason"] = f"硬體解碼在 {frames_read}/{total} 幀提前結束"
+            log(f"⚠ 硬體解碼在 {frames_read}/{total} 幀提前結束，改用軟體解碼重跑")
+            return _RETRY_SW
+        log(f"⚠ 影片在 {frames_read}/{total} 幀提前結束（來源可能有損壞幀），輸出會比原片短，音軌同步截短")
+    if stats["pos_ms"] and fps > 0 and frames_read > 1:
+        # 固定幀率下最後一幀的時間戳應等於 (幀數-1)/fps；差太多代表來源是可變幀率或時間戳不連續，
+        # 以固定 fps 重新編碼後音畫會逐漸對不上
+        drift = stats["pos_ms"] / 1000.0 - (frames_read - 1) / fps
+        if abs(drift) > 0.5:
+            log(f"⚠ 來源時間戳與固定幀率相差 {drift:+.1f}s（可變幀率影片），輸出的音畫可能漂移")
+
+    try:
+        tmp_out.replace(out_path)
+    except OSError as e:
+        tmp_out.unlink(missing_ok=True)
+        report["reason"] = f"無法寫入輸出檔：{e}"
+        log(f"⚠ 無法寫入 {out_path.name}：{e}")
         return None
 
     if getattr(args, "track", True):
@@ -1385,32 +1597,81 @@ def _process_video_once(path, out_path, detector, args, sink: str, ffmpeg, log, 
     avg_boxes = stats["covered"] / max(1, written)
     box_note = f"，平均 {avg_boxes:.1f} 框/幀（尖峰 {stats['max_boxes']}）" if avg_boxes >= 3 else ""
     w, h = writer_box["size"]
+    audio_note = "，音軌直接複製" if audio_codec == "copy" else ""
+    report.update(encoder=writer.encoder, sink=sink, audio=audio_codec, hw_decode=hw_decode)
     log(f"✓ {path.name} → {out_path.name}（{w}x{h}，共 {written} 幀，{elapsed:.1f}s ≈ {written / elapsed:.1f} fps；"
-        f"忙碌佔比 {parts}{box_note}；{detail}；編碼 {writer.encoder}）")
+        f"忙碌佔比 {parts}{box_note}；{detail}；編碼 {writer.encoder}{audio_note}）")
     return written, stats["faces"]
 
 
-def process_video(path: Path, out_path: Path, detector, args, log=print, progress=None, cancel=None):
+def process_video(path: Path, out_path: Path, detector, args, log=print, progress=None, cancel=None,
+                  report: dict | None = None):
     """處理單支影片。回傳 (幀數, 累計偵測次數)；失敗或取消回傳 None。
 
-    progress(done, total) 回報進度；cancel() 回傳 True 時中止並清理。
+    progress(done, total) 回報進度；cancel() 回傳 True 時中止並清理。report（可選）會寫入失敗原因
+    reason、detector_failed，成功時寫入實際用的 encoder / sink / audio / hw_decode。
     影片只解碼一遍：追蹤模式（預設）用 StreamTracker 線上補洞，args.track=False 則逐幀即時處理。
     畫面直接經 stdin 送進 ffmpeg，一次完成編碼（依 args.encoder 可用硬體編碼器）與原始音軌合併，
-    不再經過中間檔重複壓縮；沒有 ffmpeg 時退回 OpenCV 輸出（無音軌），ffmpeg 編碼失敗也會用 OpenCV 重跑。
+    不再經過中間檔重複壓縮。輸出失敗時逐級退回：硬體編碼器 → libx264 → OpenCV（無音軌）；
+    硬體編碼器失敗過一次，這個程序後續影片直接用軟體編碼。硬體解碼提前結束則改軟體解碼重跑。
     """
+    report = report if report is not None else {}
     ffmpeg = find_ffmpeg()
-    for sink in (["ffmpeg", "cv2"] if ffmpeg else ["cv2"]):
-        result = _process_video_once(path, out_path, detector, args, sink, ffmpeg, log, progress, cancel)
+    mode = getattr(args, "encoder", "auto")
+    attempts: list[tuple[str, tuple | None]] = []
+    if ffmpeg:
+        enc = pick_encoder(mode)
+        attempts.append(("ffmpeg", enc))
+        if enc != _SOFTWARE_ENCODER:
+            attempts.append(("ffmpeg", _SOFTWARE_ENCODER))
+    attempts.append(("cv2", None))
+    hw_decode = True
+    i = 0
+    while i < len(attempts):
+        sink, enc = attempts[i]
+        result = _process_video_once(path, out_path, detector, args, sink, enc, ffmpeg, log, progress, cancel,
+                                     hw_decode, report)
+        if result is _RETRY_SW:
+            hw_decode = False  # 同一個編碼器，改軟體解碼再跑一次（只會發生一次）
+            continue
         if result is not _RETRY:
             return result
-        log("  （改用 OpenCV 重新輸出，將不含音軌）")
+        i += 1
+        if i >= len(attempts):
+            break
+        if attempts[i][0] == "ffmpeg":
+            _encoder_cache[mode] = _SOFTWARE_ENCODER
+            log(f"  （硬體編碼器 {enc[0]} 失敗，改用 libx264 重新輸出；本次執行後續影片也改用軟體編碼）")
+        else:
+            log("  （改用 OpenCV 重新輸出，將不含音軌）")
     return None
 
 
 def default_output(path: Path, out_dir: Path | None) -> Path:
-    suffix = ".mp4" if path.suffix.lower() in VIDEO_EXTS else path.suffix
+    ext = path.suffix.lower()
+    if ext in VIDEO_EXTS:
+        suffix = ".mp4"
+    elif ext in _FFMPEG_ONLY_IMAGE_EXTS:
+        suffix = ".jpg"  # OpenCV 寫不出 HEIC/AVIF
+    else:
+        suffix = path.suffix
     name = f"{path.stem}_blurred{suffix}"
     return (out_dir / name) if out_dir else path.with_name(name)
+
+
+def plan_outputs(files: list[Path], out_dir: Path | None) -> list[Path]:
+    """為一批檔案決定輸出路徑。不同資料夾的同名檔輸出到同一資料夾會撞名，後者加 _2、_3 序號，不互相覆蓋。"""
+    used: set[str] = set()
+    outs: list[Path] = []
+    for p in files:
+        base = default_output(p, out_dir)
+        out, n = base, 2
+        while str(out).lower() in used:
+            out = base.with_name(f"{base.stem}_{n}{base.suffix}")
+            n += 1
+        used.add(str(out).lower())
+        outs.append(out)
+    return outs
 
 
 # ---------------------------------------------------------------------------
@@ -1483,8 +1744,7 @@ def main():
         if not files:
             sys.exit("資料夾內沒有支援的照片或影片")
         print(f"共 {len(files)} 個檔案，輸出到 {out_dir}/")
-        for p in files:
-            out = default_output(p, out_dir)
+        for p, out in zip(files, plan_outputs(files, out_dir)):
             if p.suffix.lower() in VIDEO_EXTS:
                 process_video(p, out, detector, args)
             else:
