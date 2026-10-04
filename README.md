@@ -42,6 +42,8 @@ PyInstaller 無法跨平台編譯，macOS 版要在 Mac 上建、Windows 版要�
 
 或推上 GitHub 用附的 CI 自動建雙平台：`.github/workflows/build.yml` 會在打 `v*` tag（或手動觸發 workflow_dispatch）時同時產出 `BlurFace-macos.zip` 和 `BlurFace-windows.zip`（在 Actions 的 artifacts 下載）。
 
+打包版啟動後會在背景向 GitHub 查一次最新 Release（匿名 API，不送任何個人資料），有新版就在視窗頂端顯示提示列，可一鍵前往下載或「略過此版本」。離線或逾時會靜默略過。本機從原始碼執行時版本為 `dev`，不會檢查；打包版也可用 `--no-update-check` 參數或環境變數 `BLURFACE_NO_UPDATE_CHECK=1` 關閉。版本號由 CI 從 tag 寫進 `_version.py`，發版流程仍只需推 `v*` tag。
+
 未簽章 app 的注意事項：
 
 - **macOS**：第一次開啟要對 app 右鍵 →「打開」，或執行 `xattr -cr BlurFace.app` 解除隔離

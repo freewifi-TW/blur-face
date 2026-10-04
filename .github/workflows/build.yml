@@ -78,6 +78,20 @@ jobs:
         if: runner.os == 'macOS'
         run: pip install pyinstaller
 
+      # 把 tag（v1.2.3 → "1.2.3"）寫進 _version.py：程式啟動時拿它跟 GitHub 最新 Release 比對，有新版就提醒。
+      # workflow_dispatch 沒有 tag 時維持 "dev"（不做更新檢查）。本步驟在測試之後、打包之前，兩平台都跑。
+      - name: Write _version.py from tag
+        shell: bash
+        run: |
+          python - <<'EOF'
+          import os, re
+          ref = os.environ.get("GITHUB_REF_NAME", "")
+          m = re.match(r"^v(\d+\.\d+\.\d+)", ref)
+          ver = m.group(1) if m else "dev"
+          open("_version.py", "w", encoding="utf-8").write(f'__version__ = "{ver}"\n')
+          print(f"_version.py -> {ver}")
+          EOF
+
       # 從 tag（v1.2.3 → 1.2.3.0）產生 Windows 版本資源檔；workflow_dispatch 沒有 tag 時用 0.0.0.0
       - name: Generate version_info.txt (Windows)
         if: runner.os == 'Windows'

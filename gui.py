@@ -8,10 +8,13 @@
 import argparse
 import faulthandler
 import gc
+import json
 import os
+import re
 import sys
 import time
 import traceback
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 
@@ -23,6 +26,7 @@ from PySide6.QtWidgets import (
     QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QSlider, QVBoxLayout, QWidget,
 )
 
+from _version import __version__
 from blur_faces import (
     IMAGE_EXTS, VIDEO_EXTS, create_detector, default_output, device_label,
     pick_encoder, plan_outputs, process_image, process_video, runtime_info,
@@ -57,6 +61,86 @@ def enable_crash_log():
         faulthandler.enable(_crash_file, all_threads=True)
     except Exception:  # noqa: BLE001 — 紀錄失敗不影響主程式
         _crash_file = None
+
+# --- 更新檢查 ---
+# 啟動後背景向 GitHub 查最新 Release，比目前版本新就在視窗頂端顯示提示列。
+# 匿名 API 每小時 60 次 / IP，每次啟動查一次綽綽有餘；網路不通、逾時、格式不對一律靜默略過。
+GITHUB_REPO = "freewifi-TW/blur-face"
+RELEASES_URL = f"https://github.com/{GITHUB_REPO}/releases/latest"
+UPDATE_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+UPDATE_TIMEOUT = 8  # 秒
+SKIP_FILE = LOG_DIR / "skip_update.txt"  # 使用者按「略過此版本」時記下的 tag
+
+
+def parse_version(text: str) -> tuple[int, ...] | None:
+    """'v1.3.4' / '1.3.4' / 'v1.3.4-beta' → (1, 3, 4)；'dev' 或空字串 → None。"""
+    m = re.match(r"^\s*v?(\d+(?:\.\d+)*)", text or "")
+    return tuple(int(x) for x in m.group(1).split(".")) if m else None
+
+
+def fetch_latest_release(url: str = UPDATE_API, timeout: float = UPDATE_TIMEOUT) -> dict | None:
+    """取得最新 Release 的 {'tag': 'v1.3.4', 'url': 'https://github.com/.../releases/tag/v1.3.4'}。失敗回 None。"""
+    try:
+        req = urllib.request.Request(url, headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": f"BlurFace/{__version__}",
+        })
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        tag = data.get("tag_name")
+        if not isinstance(tag, str) or not tag:
+            return None
+        return {"tag": tag, "url": data.get("html_url") or RELEASES_URL}
+    except Exception:  # noqa: BLE001 — 離線、逾時、被牆、JSON 壞掉都只是「這次不提醒」
+        return None
+
+
+def check_update(current: str, latest: dict | None, skipped: str | None = None) -> dict | None:
+    """純比較邏輯：最新版比目前新、且使用者沒按過「略過此版本」才回傳 latest。"""
+    cur = parse_version(current)
+    if cur is None or not latest:  # 開發版（dev）不提醒
+        return None
+    new = parse_version(latest["tag"])
+    if new is None or new <= cur:
+        return None
+    if skipped and parse_version(skipped) == new:
+        return None
+    return latest
+
+
+def read_skipped() -> str | None:
+    try:
+        return SKIP_FILE.read_text(encoding="utf-8").strip() or None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def write_skipped(tag: str):
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        SKIP_FILE.write_text(tag, encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def update_check_enabled() -> bool:
+    """開發版、命令列 --no-update-check、環境變數 BLURFACE_NO_UPDATE_CHECK=1 都關閉檢查。"""
+    if parse_version(__version__) is None:
+        return False
+    if "--no-update-check" in sys.argv or os.environ.get("BLURFACE_NO_UPDATE_CHECK"):
+        return False
+    return True
+
+
+class UpdateChecker(QThread):
+    """背景查一次 GitHub，有新版就發 sig_found(tag, url)。失敗什麼都不發。"""
+    sig_found = Signal(str, str)
+
+    def run(self):
+        found = check_update(__version__, fetch_latest_release(), read_skipped())
+        if found:
+            self.sig_found.emit(found["tag"], found["url"])
+
 
 DETECTOR_CHOICES = [
     ("高準確度（SCRFD，建議）", "scrfd"),
@@ -217,10 +301,13 @@ class Worker(QThread):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, check_updates: bool | None = None):
         super().__init__()
-        self.setWindowTitle("Blur Face — AI 人臉打碼")
+        self.setWindowTitle(f"Blur Face — AI 人臉打碼  v{__version__}")
         self.resize(680, 780)
+        self.update_checker: UpdateChecker | None = None
+        self.update_url = RELEASES_URL
+        self.update_tag = ""
         self.files: list[Path] = []
         self.worker: Worker | None = None
         self.out_dir: Path | None = None
@@ -239,6 +326,29 @@ class MainWindow(QMainWindow):
         root = QWidget()
         self.setCentralWidget(root)
         layout = QVBoxLayout(root)
+
+        # --- 更新提示列（預設隱藏，背景檢查到新版才顯示）---
+        self.update_bar = QWidget()
+        self.update_bar.setObjectName("updateBar")
+        self.update_bar.setStyleSheet(
+            "QWidget#updateBar { background: #fff4ce; border: 1px solid #e0c060; border-radius: 4px; }")
+        bar = QHBoxLayout(self.update_bar)
+        bar.setContentsMargins(8, 4, 8, 4)
+        self.update_lbl = QLabel()
+        bar.addWidget(self.update_lbl, stretch=1)
+        dl_btn = QPushButton("前往下載")
+        dl_btn.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(self.update_url)))
+        skip_btn = QPushButton("略過此版本")
+        skip_btn.setToolTip("這個版本不再提醒；之後更新的版本仍會提醒")
+        skip_btn.clicked.connect(self.skip_update)
+        close_btn = QPushButton("✕")
+        close_btn.setFixedWidth(28)
+        close_btn.setToolTip("先關掉，下次啟動再提醒")
+        close_btn.clicked.connect(self.update_bar.hide)
+        for b in (dl_btn, skip_btn, close_btn):
+            bar.addWidget(b)
+        self.update_bar.hide()
+        layout.addWidget(self.update_bar)
 
         # --- 檔案清單 ---
         self.list = DropList()
@@ -450,6 +560,26 @@ class MainWindow(QMainWindow):
         ctrl.addWidget(self.cancel_btn)
         layout.addLayout(ctrl)
 
+        if check_updates is None:
+            check_updates = update_check_enabled()
+        if check_updates:
+            self.update_checker = UpdateChecker()
+            self.update_checker.sig_found.connect(self.on_update_found)
+            self.update_checker.start()
+
+    # --- 更新提示 ---
+    def on_update_found(self, tag: str, url: str):
+        self.update_tag = tag
+        self.update_url = url or RELEASES_URL
+        self.update_lbl.setText(f"有新版本 {tag} 可下載（目前 v{__version__}）")
+        self.update_bar.show()
+        self.append_log(f"GitHub 有新版本 {tag}（目前 v{__version__}）：{self.update_url}")
+
+    def skip_update(self):
+        if self.update_tag:
+            write_skipped(self.update_tag)
+        self.update_bar.hide()
+
     # --- 檔案管理 ---
     def add_paths(self, paths: list[str]):
         for f in collect_media(paths):
@@ -535,7 +665,7 @@ class MainWindow(QMainWindow):
         self.status.setText("處理中…")
         args = self.build_args()
         if not self.logged_env:
-            self.append_log(runtime_info())
+            self.append_log(f"Blur Face v{__version__} · {runtime_info()}")
             self.logged_env = True
         self.append_log(
             f"開始處理 {len(self.files)} 個檔案 · "
@@ -587,6 +717,8 @@ class MainWindow(QMainWindow):
             self.worker.cancel()
             self.status.setText("正在停止背景處理…")
             self.worker.wait(30_000)
+        if self.update_checker is not None and self.update_checker.isRunning():
+            self.update_checker.wait(UPDATE_TIMEOUT * 1000 + 2000)
         self.cached_detector = None
         event.accept()
 
@@ -610,7 +742,7 @@ def smoke_test() -> int:
     import cv2
 
     app = QApplication(sys.argv)
-    win = MainWindow()  # noqa: F841 確認 UI 可建立
+    win = MainWindow(check_updates=False)  # noqa: F841 確認 UI 可建立；自我檢查不連網
     det = create_detector(argparse.Namespace(detector="scrfd", conf=0.4, det_size=640, head=True, device="auto"))
     det.detect(np.zeros((480, 640, 3), dtype=np.uint8))
     assert find_ffmpeg(), "找不到 ffmpeg"
